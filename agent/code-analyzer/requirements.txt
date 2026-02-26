@@ -1,0 +1,13 @@
+# Code Analyzer Agent Requirements
+
+# Python 3.8+ (minimum)
+# No external dependencies required for basic functionality
+# Standard library only:
+# - ast (syntax checking)
+# - re (pattern matching)
+# - pathlib (file handling)
+
+# Optional: For advanced features
+# pylint>=2.13.0  # For additional code analysis
+# flake8>=4.0.0   # For style guide enforcement
+# black>=22.0.0   # For code formatting suggestions
