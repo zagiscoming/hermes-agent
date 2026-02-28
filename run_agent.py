@@ -2497,15 +2497,12 @@ class AIAgent:
                     # answer and calls memory/skill tools as a side-effect in the same
                     # turn. If the follow-up turn after tools is empty, we use this.
                     turn_content = assistant_message.content or ""
-if turn_content and self._has_content_after_think_block(turn_content):
-    # Store cleaned version to prevent <think> leakage in fallback
-    cleaned_turn_content = self._strip_think_blocks(turn_content).strip()
-    self._last_content_with_tools = cleaned_turn_content if cleaned_turn_content else None
-
-    if self.quiet_mode and cleaned_turn_content:
-        preview = cleaned_turn_content[:120] + "..." if len(cleaned_turn_content) > 120 else cleaned_turn_content
-        print(f"  ┊ 💬 {preview}")
-                    
+                    cleaned_turn_content = ""  # default to avoid UnboundLocalError
+                    if  turn_content and self._has_content_after_think_block(turn_content):
+                        cleaned_turn_content = self._strip_think_blocks(turn_content).strip()
+                        self._last_content_with_tools = cleaned_turn_content if cleaned_turn_content else None
+                    if  self.quiet_mode and cleaned_turn_content:
+                        print(f"  ┊ 💬 {cleaned_turn_content[:120] + '...' if len(cleaned_turn_content) > 120 else cleaned_turn_content}")
                     messages.append(assistant_msg)
                     self._log_msg_to_db(assistant_msg)
                     
