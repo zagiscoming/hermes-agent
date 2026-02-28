@@ -5,9 +5,9 @@ Hermes Agent can connect to messaging platforms like Telegram, Discord, and What
 ## Quick Start
 
 ```bash
-# 1. Set your bot token(s) in .env file
-echo 'TELEGRAM_BOT_TOKEN="your_telegram_bot_token"' >> .env
-echo 'DISCORD_BOT_TOKEN="your_discord_bot_token"' >> .env
+# 1. Set your bot token(s) in ~/.hermes/.env
+echo 'TELEGRAM_BOT_TOKEN="your_telegram_bot_token"' >> ~/.hermes/.env
+echo 'DISCORD_BOT_TOKEN="your_discord_bot_token"' >> ~/.hermes/.env
 
 # 2. Test the gateway (foreground)
 ./scripts/hermes-gateway run
@@ -29,7 +29,7 @@ python cli.py --gateway  # Runs in foreground, useful for debugging
 
 ## Architecture Overview
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                      Hermes Gateway                             │
 ├─────────────────────────────────────────────────────────────────┤
@@ -223,11 +223,9 @@ MESSAGING_CWD=/home/myuser
 # TOOL PROGRESS NOTIFICATIONS
 # =============================================================================
 
-# Show progress messages as agent uses tools
-HERMES_TOOL_PROGRESS=true
-
-# Mode: "new" (only when tool changes) or "all" (every tool call)
-HERMES_TOOL_PROGRESS_MODE=new
+# Tool progress is now configured in config.yaml:
+#   display:
+#     tool_progress: all    # off | new | all | verbose
 
 # =============================================================================
 # SESSION SETTINGS
@@ -301,9 +299,9 @@ The gateway keeps the "typing..." indicator active throughout processing, refres
 
 ### Tool Progress Notifications
 
-When `HERMES_TOOL_PROGRESS=true`, the bot sends status messages as it works:
+When `tool_progress` is enabled in `config.yaml`, the bot sends status messages as it works:
 
-```
+```text
 💻 `ls -la`...
 🔍 web_search...
 📄 web_extract...
@@ -345,7 +343,7 @@ The `text_to_speech` tool generates audio that the gateway delivers as native vo
 
 Voice and provider are configured by the user in `~/.hermes/config.yaml` under the `tts:` key. The model only sends text; it does not choose the voice.
 
-The tool returns a `MEDIA:<path>` tag that the gateway send pipeline intercepts and delivers as a native audio message. If `[[audio_as_voice]]` is present (Opus format available), Telegram sends it as a voice bubble instead of an audio file.
+The tool returns a `MEDIA:<path>` tag that the gateway sending pipeline intercepts and delivers as a native audio message. If `[[audio_as_voice]]` is present (Opus format available), Telegram sends it as a voice bubble instead of an audio file.
 
 **Telegram voice bubbles & ffmpeg:**
 
@@ -365,7 +363,7 @@ Cron jobs are executed automatically by the gateway daemon. When the gateway is 
 
 When scheduling cron jobs, you can specify where the output should be delivered:
 
-```
+```text
 User: "Remind me to check the server in 30 minutes"
 
 Agent uses: schedule_cronjob(
@@ -389,7 +387,7 @@ Agent uses: schedule_cronjob(
 
 The agent knows where it is via injected context:
 
-```
+```text
 ## Current Session Context
 
 **Source:** Telegram (group: Dev Team, ID: -1001234567890)

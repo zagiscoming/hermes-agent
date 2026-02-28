@@ -133,7 +133,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 
 All your settings are stored in `~/.hermes/` for easy access:
 
-```
+```text
 ~/.hermes/
 ├── config.yaml     # Settings (model, terminal, TTS, compression, etc.)
 ├── .env            # API keys and secrets
@@ -171,6 +171,7 @@ hermes config set OPENROUTER_API_KEY sk-or-...  # Saves to .env
 | Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
 | OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
 | RL Training | [Tinker](https://tinker-console.thinkingmachines.ai/) + [WandB](https://wandb.ai/) | `TINKER_API_KEY`, `WANDB_API_KEY` |
+| Cross-session user modeling | [Honcho](https://honcho.dev/) | `HONCHO_API_KEY` |
 
 ---
 
@@ -324,13 +325,21 @@ TERMINAL_CWD=/workspace                # All terminal sessions (local or contain
 
 ### Tool Progress Notifications
 
-Get real-time updates as the agent works:
+Control how much tool activity is displayed. Set in `~/.hermes/config.yaml`:
 
-```bash
-# Enable in ~/.hermes/.env
-HERMES_TOOL_PROGRESS=true
-HERMES_TOOL_PROGRESS_MODE=all    # or "new" for only when tool changes
+```yaml
+display:
+  tool_progress: all    # off | new | all | verbose
 ```
+
+| Mode | What you see |
+|------|-------------|
+| `off` | Silent — just the final response |
+| `new` | Tool indicator only when the tool changes (skip repeats) |
+| `all` | Every tool call with a short preview (default) |
+| `verbose` | Full args, results, and debug logs |
+
+Toggle at runtime in the CLI with `/verbose` (cycles through all four modes).
 
 ---
 
@@ -547,6 +556,45 @@ memory:
   user_char_limit: 1375     # ~500 tokens
 ```
 
+### 🔗 Honcho Integration (Cross-Session User Modeling)
+
+Optional cloud-based user modeling via [Honcho](https://honcho.dev/) by Plastic Labs. While MEMORY.md and USER.md are local file-based memory, Honcho builds a deeper, AI-generated understanding of the user that persists across sessions and works across tools (Claude Code, Cursor, Hermes, etc.).
+
+When enabled, Honcho runs **alongside** existing memory — USER.md stays as-is, and Honcho adds an additional layer of user context:
+
+- **Prefetch**: Each turn, Honcho's user representation is fetched and injected into the system prompt
+- **Sync**: After each conversation, messages are synced to Honcho for ongoing user modeling
+- **Query tool**: The agent can actively query its understanding of the user via `query_user_context`
+
+**Setup:**
+```bash
+# 1. Install the optional dependency
+uv pip install honcho-ai
+
+# 2. Get an API key from https://app.honcho.dev
+
+# 3. Create ~/.honcho/config.json (shared with other Honcho-enabled tools)
+cat > ~/.honcho/config.json << 'EOF'
+{
+  "enabled": true,
+  "apiKey": "your-honcho-api-key",
+  "peerName": "your-name",
+  "hosts": {
+    "hermes": {
+      "workspace": "hermes"
+    }
+  }
+}
+EOF
+```
+
+Or configure via environment variable:
+```bash
+hermes config set HONCHO_API_KEY your-key
+```
+
+Fully opt-in — zero behavior change when disabled or unconfigured. All Honcho calls are non-fatal; if the service is unreachable, the agent continues normally.
+
 ### 📄 Context Files (SOUL.md, AGENTS.md, .cursorrules)
 
 Drop these files in your project directory and the agent automatically picks them up:
@@ -648,7 +696,7 @@ Even if no messaging platforms are configured, the gateway stays running for cro
 
 ### 🛡️ Exec Approval (Messaging Platforms)
 
-When the agent tries to run a potentially dangerous command (rm -rf, chmod 777, etc.) on Telegram/Discord/WhatsApp, instead of blocking it silently, it asks the user for approval:
+When the agent tries to run a potentially dangerous command (`rm -rf`, `chmod 777`, etc.) on Telegram/Discord/WhatsApp, instead of blocking it silently, it asks the user for approval:
 
 > ⚠️ This command is potentially dangerous (recursive delete). Reply "yes" to approve.
 
@@ -894,7 +942,7 @@ code_execution:
 The `delegate_task` tool spawns child AIAgent instances with isolated context, restricted toolsets, and their own terminal sessions. Each child gets a fresh conversation and works independently -- only its final summary enters the parent's context.
 
 **Single task:**
-```
+```python
 delegate_task(goal="Debug why tests fail", context="Error: assertion in test_foo.py line 42", toolsets=["terminal", "file"])
 ```
 
@@ -973,7 +1021,7 @@ python rl_cli.py --model "anthropic/claude-sonnet-4-20250514"
 
 ### 🧪 Atropos RL Environments
 
-Hermes-Agent integrates with the [Atropos](https://github.com/NousResearch/atropos) RL framework through a layered environment system. This allows training models with reinforcement learning on agentic tasks using hermes-agent's tools.
+Hermes Agent integrates with the [Atropos](https://github.com/NousResearch/atropos) RL framework through a layered environment system. This allows training models with reinforcement learning on agentic tasks using Hermes Agent's tools.
 
 #### Architecture
 
@@ -1477,6 +1525,7 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 | `BROWSERBASE_API_KEY` | Browser automation |
 | `BROWSERBASE_PROJECT_ID` | Browserbase project |
 | `FAL_KEY` | Image generation (fal.ai) |
+| `HONCHO_API_KEY` | Cross-session user modeling ([honcho.dev](https://honcho.dev/)) |
 
 **Terminal Backend:**
 | Variable | Description |
@@ -1527,8 +1576,6 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 | Variable | Description |
 |----------|-------------|
 | `HERMES_MAX_ITERATIONS` | Max tool-calling iterations per conversation (default: 60) |
-| `HERMES_TOOL_PROGRESS` | Send progress messages when using tools (`true`/`false`) |
-| `HERMES_TOOL_PROGRESS_MODE` | `all` (every call, default) or `new` (only when tool changes) |
 
 **Context Compression:**
 | Variable | Description |

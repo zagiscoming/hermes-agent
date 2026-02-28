@@ -201,7 +201,7 @@ def load_cli_config() -> Dict[str, Any]:
             "max_tool_calls": 50,  # Max RPC tool calls per execution
         },
         "delegation": {
-            "max_iterations": 25,  # Max tool-calling turns per child agent
+            "max_iterations": 45,  # Max tool-calling turns per child agent
             "default_toolsets": ["terminal", "file", "web"],  # Default toolsets for subagents
         },
     }
@@ -286,6 +286,7 @@ def load_cli_config() -> Dict[str, Any]:
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
         "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+        "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
         # Sudo support (works with all backends)
         "sudo_password": "SUDO_PASSWORD",
     }
@@ -298,7 +299,12 @@ def load_cli_config() -> Dict[str, Any]:
     for config_key, env_var in env_mappings.items():
         if config_key in terminal_config:
             if _file_has_terminal_config or env_var not in os.environ:
-                os.environ[env_var] = str(terminal_config[config_key])
+                val = terminal_config[config_key]
+                if isinstance(val, list):
+                    import json
+                    os.environ[env_var] = json.dumps(val)
+                else:
+                    os.environ[env_var] = str(val)
     
     # Apply browser config to environment variables
     browser_config = defaults.get("browser", {})
@@ -787,7 +793,9 @@ class HermesCLI:
         # Initialize Rich console
         self.console = Console()
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
-        self.verbose = verbose if verbose is not None else CLI_CONFIG["agent"].get("verbose", False)
+        # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
+        self.tool_progress_mode = CLI_CONFIG["display"].get("tool_progress", "all")
+        self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
         
         # Configuration - priority: CLI args > env vars > config file
         # Model can come from: CLI arg, LLM_MODEL env, OPENAI_MODEL env (custom endpoint), or config
@@ -983,6 +991,7 @@ class HermesCLI:
                 platform="cli",
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
+                honcho_session_key=self.session_id,
             )
             return True
         except Exception as e:
@@ -1681,12 +1690,45 @@ class HermesCLI:
             self._handle_skills_command(cmd_original)
         elif cmd_lower == "/platforms" or cmd_lower == "/gateway":
             self._show_gateway_status()
+        elif cmd_lower == "/verbose":
+            self._toggle_verbose()
         else:
             self.console.print(f"[bold red]Unknown command: {cmd_lower}[/]")
             self.console.print("[dim #B8860B]Type /help for available commands[/]")
         
         return True
     
+    def _toggle_verbose(self):
+        """Cycle tool progress mode: off → new → all → verbose → off."""
+        cycle = ["off", "new", "all", "verbose"]
+        try:
+            idx = cycle.index(self.tool_progress_mode)
+        except ValueError:
+            idx = 2  # default to "all"
+        self.tool_progress_mode = cycle[(idx + 1) % len(cycle)]
+        self.verbose = self.tool_progress_mode == "verbose"
+
+        if self.agent:
+            self.agent.verbose_logging = self.verbose
+            self.agent.quiet_mode = not self.verbose
+
+        labels = {
+            "off": "[dim]Tool progress: OFF[/] — silent mode, just the final response.",
+            "new": "[yellow]Tool progress: NEW[/] — show each new tool (skip repeats).",
+            "all": "[green]Tool progress: ALL[/] — show every tool call.",
+            "verbose": "[bold green]Tool progress: VERBOSE[/] — full args, results, and debug logs.",
+        }
+        self.console.print(labels.get(self.tool_progress_mode, ""))
+
+        if self.verbose:
+            logging.getLogger().setLevel(logging.DEBUG)
+            for noisy in ('openai', 'openai._base_client', 'httpx', 'httpcore', 'asyncio', 'hpack', 'grpc', 'modal'):
+                logging.getLogger(noisy).setLevel(logging.WARNING)
+        else:
+            logging.getLogger().setLevel(logging.INFO)
+            for quiet_logger in ('tools', 'minisweagent', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
+                logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
     def _clarify_callback(self, question, choices):
         """
         Platform callback for the clarify tool. Called from the agent thread.

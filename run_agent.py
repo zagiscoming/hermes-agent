@@ -131,6 +131,7 @@ class AIAgent:
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
+        honcho_session_key: str = None,
     ):
         """
         Initialize the AI Agent.
@@ -168,6 +169,8 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
+            honcho_session_key (str): Session key for Honcho integration (e.g., "telegram:123456" or CLI session_id).
+                When provided and Honcho is enabled in config, enables persistent cross-session user modeling.
         """
         self.model = model
         self.max_iterations = max_iterations
@@ -183,6 +186,13 @@ class AIAgent:
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
         # When no base_url is provided, the client defaults to OpenRouter, so reflect that here.
         self.base_url = base_url or OPENROUTER_BASE_URL
+        if base_url and "api.anthropic.com" in base_url.strip().lower():
+            raise ValueError(
+                "Anthropic's native /v1/messages API is not supported yet (planned for a future release). "
+                "Hermes currently requires OpenAI-compatible /chat/completions endpoints. "
+                "To use Claude models now, route through OpenRouter (OPENROUTER_API_KEY) "
+                "or any OpenAI-compatible proxy that wraps the Anthropic API."
+            )
         self.tool_progress_callback = tool_progress_callback
         self.clarify_callback = clarify_callback
         self._last_reported_tool = None  # Track for "new tool" mode
@@ -418,6 +428,46 @@ class AIAgent:
             except Exception:
                 pass  # Memory is optional -- don't break agent init
         
+        # Honcho AI-native memory (cross-session user modeling)
+        # Reads ~/.honcho/config.json as the single source of truth.
+        self._honcho = None  # HonchoSessionManager | None
+        self._honcho_session_key = honcho_session_key
+        if not skip_memory:
+            try:
+                from honcho_integration.client import HonchoClientConfig, get_honcho_client
+                hcfg = HonchoClientConfig.from_global_config()
+                if hcfg.enabled and hcfg.api_key:
+                    from honcho_integration.session import HonchoSessionManager
+                    client = get_honcho_client(hcfg)
+                    self._honcho = HonchoSessionManager(
+                        honcho=client,
+                        config=hcfg,
+                        context_tokens=hcfg.context_tokens,
+                    )
+                    # Resolve session key: explicit arg > global sessions map > fallback
+                    if not self._honcho_session_key:
+                        self._honcho_session_key = (
+                            hcfg.resolve_session_name()
+                            or "hermes-default"
+                        )
+                    # Ensure session exists in Honcho
+                    self._honcho.get_or_create(self._honcho_session_key)
+                    # Inject session context into the honcho tool module
+                    from tools.honcho_tools import set_session_context
+                    set_session_context(self._honcho, self._honcho_session_key)
+                    logger.info(
+                        "Honcho active (session: %s, user: %s, workspace: %s)",
+                        self._honcho_session_key, hcfg.peer_name, hcfg.workspace_id,
+                    )
+                else:
+                    if not hcfg.enabled:
+                        logger.debug("Honcho disabled in global config")
+                    elif not hcfg.api_key:
+                        logger.debug("Honcho enabled but no API key configured")
+            except Exception as e:
+                logger.debug("Honcho init failed (non-fatal): %s", e)
+                self._honcho = None
+
         # Skills config: nudge interval for skill creation reminders
         self._skill_nudge_interval = 15
         try:
@@ -429,9 +479,10 @@ class AIAgent:
         
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
-        # Configuration via environment variables (can be set in .env or cli-config.yaml)
+        # Configuration via config.yaml (compression section) or environment variables
         compression_threshold = float(os.getenv("CONTEXT_COMPRESSION_THRESHOLD", "0.85"))
         compression_enabled = os.getenv("CONTEXT_COMPRESSION_ENABLED", "true").lower() in ("true", "1", "yes")
+        compression_summary_model = os.getenv("CONTEXT_COMPRESSION_MODEL") or None
         
         self.context_compressor = ContextCompressor(
             model=self.model,
@@ -439,6 +490,7 @@ class AIAgent:
             protect_first_n=3,
             protect_last_n=4,
             summary_target_tokens=500,
+            summary_model_override=compression_summary_model,
             quiet_mode=self.quiet_mode,
         )
         self.compression_enabled = compression_enabled
@@ -1069,7 +1121,67 @@ class AIAgent:
     def is_interrupted(self) -> bool:
         """Check if an interrupt has been requested."""
         return self._interrupt_requested
-    
+
+    # ── Honcho integration helpers ──
+
+    def _honcho_prefetch(self, user_message: str) -> str:
+        """Fetch user context from Honcho for system prompt injection.
+
+        Returns a formatted context block, or empty string if unavailable.
+        """
+        if not self._honcho or not self._honcho_session_key:
+            return ""
+        try:
+            ctx = self._honcho.get_prefetch_context(self._honcho_session_key, user_message)
+            if not ctx:
+                return ""
+            parts = []
+            rep = ctx.get("representation", "")
+            card = ctx.get("card", "")
+            if rep:
+                parts.append(rep)
+            if card:
+                parts.append(card)
+            if not parts:
+                return ""
+            return "# Honcho User Context\n" + "\n\n".join(parts)
+        except Exception as e:
+            logger.debug("Honcho prefetch failed (non-fatal): %s", e)
+            return ""
+
+    def _honcho_save_user_observation(self, content: str) -> str:
+        """Route a memory tool target=user add to Honcho.
+
+        Sends the content as a user peer message so Honcho's reasoning
+        model can incorporate it into the user representation.
+        """
+        if not content or not content.strip():
+            return json.dumps({"success": False, "error": "Content cannot be empty."})
+        try:
+            session = self._honcho.get_or_create(self._honcho_session_key)
+            session.add_message("user", f"[observation] {content.strip()}")
+            self._honcho.save(session)
+            return json.dumps({
+                "success": True,
+                "target": "user",
+                "message": "Saved to Honcho user model.",
+            })
+        except Exception as e:
+            logger.debug("Honcho user observation failed: %s", e)
+            return json.dumps({"success": False, "error": f"Honcho save failed: {e}"})
+
+    def _honcho_sync(self, user_content: str, assistant_content: str) -> None:
+        """Sync the user/assistant message pair to Honcho."""
+        if not self._honcho or not self._honcho_session_key:
+            return
+        try:
+            session = self._honcho.get_or_create(self._honcho_session_key)
+            session.add_message("user", user_content)
+            session.add_message("assistant", assistant_content)
+            self._honcho.save(session)
+        except Exception as e:
+            logger.debug("Honcho sync failed (non-fatal): %s", e)
+
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
         Assemble the full system prompt from all layers.
@@ -1109,6 +1221,7 @@ class AIAgent:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
                     prompt_parts.append(mem_block)
+            # USER.md is always included when enabled -- Honcho prefetch is additive.
             if self._user_profile_enabled:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
@@ -1199,7 +1312,7 @@ class AIAgent:
             "model": self.model,
             "messages": api_messages,
             "tools": self.tools if self.tools else None,
-            "timeout": 600.0,
+            "timeout": 900.0,
         }
 
         if self.max_tokens is not None:
@@ -1351,14 +1464,18 @@ class AIAgent:
                         if tc.function.name == "memory":
                             try:
                                 args = json.loads(tc.function.arguments)
+                                flush_target = args.get("target", "memory")
                                 from tools.memory_tool import memory_tool as _memory_tool
                                 result = _memory_tool(
                                     action=args.get("action"),
-                                    target=args.get("target", "memory"),
+                                    target=flush_target,
                                     content=args.get("content"),
                                     old_text=args.get("old_text"),
                                     store=self._memory_store,
                                 )
+                                # Also send user observations to Honcho when active
+                                if self._honcho and flush_target == "user" and args.get("action") == "add":
+                                    self._honcho_save_user_observation(args.get("content", ""))
                                 if not self.quiet_mode:
                                     print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
                             except Exception as e:
@@ -1484,14 +1601,18 @@ class AIAgent:
                 if self.quiet_mode:
                     print(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
+                target = function_args.get("target", "memory")
                 from tools.memory_tool import memory_tool as _memory_tool
                 function_result = _memory_tool(
                     action=function_args.get("action"),
-                    target=function_args.get("target", "memory"),
+                    target=target,
                     content=function_args.get("content"),
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
                 )
+                # Also send user observations to Honcho when active
+                if self._honcho and target == "user" and function_args.get("action") == "add":
+                    self._honcho_save_user_observation(function_args.get("content", ""))
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     print(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
@@ -1738,6 +1859,10 @@ class AIAgent:
         # Track user turns for memory flush and periodic nudge logic
         self._user_turn_count += 1
 
+        # Preserve the original user message before nudge injection.
+        # Honcho should receive the actual user input, not system nudges.
+        original_user_message = user_message
+
         # Periodic memory nudge: remind the model to consider saving memories.
         # Counter resets whenever the memory tool is actually used.
         if (self._memory_nudge_interval > 0
@@ -1761,6 +1886,14 @@ class AIAgent:
                 "If you discovered a reusable workflow, consider saving it as a skill.]"
             )
             self._iters_since_skill = 0
+
+        # Honcho prefetch: retrieve user context for system prompt injection
+        self._honcho_context = ""
+        if self._honcho and self._honcho_session_key:
+            try:
+                self._honcho_context = self._honcho_prefetch(user_message)
+            except Exception as e:
+                logger.debug("Honcho prefetch failed (non-fatal): %s", e)
 
         # Add user message
         user_msg = {"role": "user", "content": user_message}
@@ -1840,6 +1973,8 @@ class AIAgent:
             effective_system = active_system_prompt or ""
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            if self._honcho_context:
+                effective_system = (effective_system + "\n\n" + self._honcho_context).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             
@@ -2092,11 +2227,45 @@ class AIAgent:
                             "interrupted": True,
                         }
                     
+                    # Check for 413 payload-too-large BEFORE generic 4xx handler.
+                    # A 413 is a payload-size error — the correct response is to
+                    # compress history and retry, not abort immediately.
+                    status_code = getattr(api_error, "status_code", None)
+                    is_payload_too_large = (
+                        status_code == 413
+                        or 'request entity too large' in error_msg
+                        or 'payload too large' in error_msg
+                        or 'error code: 413' in error_msg
+                    )
+
+                    if is_payload_too_large:
+                        print(f"{self.log_prefix}⚠️  Request payload too large (413) - attempting compression...")
+
+                        original_len = len(messages)
+                        messages, active_system_prompt = self._compress_context(
+                            messages, system_message, approx_tokens=approx_tokens
+                        )
+
+                        if len(messages) < original_len:
+                            print(f"{self.log_prefix}   🗜️  Compressed {original_len} → {len(messages)} messages, retrying...")
+                            continue  # Retry with compressed messages
+                        else:
+                            print(f"{self.log_prefix}❌ Payload too large and cannot compress further.")
+                            logging.error(f"{self.log_prefix}413 payload too large. Cannot compress further.")
+                            self._persist_session(messages, conversation_history)
+                            return {
+                                "messages": messages,
+                                "completed": False,
+                                "api_calls": api_call_count,
+                                "error": "Request payload too large (413). Cannot compress further.",
+                                "partial": True
+                            }
+
                     # Check for non-retryable client errors (4xx HTTP status codes).
                     # These indicate a problem with the request itself (bad model ID,
                     # invalid API key, forbidden, etc.) and will never succeed on retry.
-                    status_code = getattr(api_error, "status_code", None)
-                    is_client_status_error = isinstance(status_code, int) and 400 <= status_code < 500
+                    # Note: 413 is excluded — it's handled above via compression.
+                    is_client_status_error = isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 413
                     is_client_error = is_client_status_error or any(phrase in error_msg for phrase in [
                         'error code: 400', 'error code: 401', 'error code: 403',
                         'error code: 404', 'error code: 422',
@@ -2104,7 +2273,7 @@ class AIAgent:
                         'invalid api key', 'invalid_api_key', 'authentication',
                         'unauthorized', 'forbidden', 'not found',
                     ])
-                    
+
                     if is_client_error:
                         self._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
@@ -2124,8 +2293,9 @@ class AIAgent:
                     
                     # Check for non-retryable errors (context length exceeded)
                     is_context_length_error = any(phrase in error_msg for phrase in [
-                        'context length', 'maximum context', 'token limit', 
-                        'too many tokens', 'reduce the length', 'exceeds the limit'
+                        'context length', 'maximum context', 'token limit',
+                        'too many tokens', 'reduce the length', 'exceeds the limit',
+                        'request entity too large',  # OpenRouter/Nous 413 safety net
                     ])
                     
                     if is_context_length_error:
@@ -2160,9 +2330,10 @@ class AIAgent:
                         raise api_error
 
                     wait_time = min(2 ** retry_count, 60)  # Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s, 60s
-                    print(f"⚠️  OpenAI-compatible API call failed (attempt {retry_count}/{max_retries}): {str(api_error)[:100]}")
-                    print(f"⏳ Retrying in {wait_time}s...")
                     logging.warning(f"API retry {retry_count}/{max_retries} after error: {api_error}")
+                    if retry_count >= max_retries:
+                        print(f"{self.log_prefix}⚠️  API call failed after {retry_count} attempts: {str(api_error)[:100]}")
+                        print(f"{self.log_prefix}⏳ Final retry in {wait_time}s...")
                     
                     # Sleep in small increments so we can respond to interrupts quickly
                     # instead of blocking the entire wait_time in one sleep() call
@@ -2501,7 +2672,11 @@ class AIAgent:
 
         # Persist session to both JSON log and SQLite
         self._persist_session(messages, conversation_history)
-        
+
+        # Sync conversation to Honcho for user modeling
+        if final_response and not interrupted:
+            self._honcho_sync(original_user_message, final_response)
+
         # Build result with interrupt info if applicable
         result = {
             "final_response": final_response,
