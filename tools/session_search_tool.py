@@ -20,21 +20,18 @@ import concurrent.futures
 import json
 import os
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 
-from openai import AsyncOpenAI, OpenAI
-
-from agent.auxiliary_client import get_async_text_auxiliary_client
-
-# Resolve the async auxiliary client at import time so we have the model slug.
-# Handles Codex Responses API adapter transparently.
-_async_aux_client, _SUMMARIZER_MODEL = get_async_text_auxiliary_client()
+from agent.auxiliary_client import async_call_llm
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
 
 
-def _format_timestamp(ts) -> str:
-    """Convert a Unix timestamp (float/int) or ISO string to a human-readable date."""
+def _format_timestamp(ts: Union[int, float, str, None]) -> str:
+    """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
+
+    Returns "unknown" for None, str(ts) if conversion fails.
+    """
     if ts is None:
         return "unknown"
     try:
@@ -48,8 +45,11 @@ def _format_timestamp(ts) -> str:
                 dt = datetime.fromtimestamp(float(ts))
                 return dt.strftime("%B %d, %Y at %I:%M %p")
             return ts
-    except Exception:
-        pass
+    except (ValueError, OSError, OverflowError) as e:
+        # Log specific errors for debugging while gracefully handling edge cases
+        logging.debug("Failed to format timestamp %s: %s", ts, e)
+    except Exception as e:
+        logging.debug("Unexpected error formatting timestamp %s: %s", ts, e)
     return str(ts)
 
 
@@ -150,26 +150,22 @@ async def _summarize_session(
         f"Summarize this conversation with focus on: {query}"
     )
 
-    if _async_aux_client is None or _SUMMARIZER_MODEL is None:
-        logging.warning("No auxiliary model available for session summarization")
-        return None
-
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            from agent.auxiliary_client import get_auxiliary_extra_body, auxiliary_max_tokens_param
-            _extra = get_auxiliary_extra_body()
-            response = await _async_aux_client.chat.completions.create(
-                model=_SUMMARIZER_MODEL,
+            response = await async_call_llm(
+                task="session_search",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                **({} if not _extra else {"extra_body": _extra}),
                 temperature=0.1,
-                **auxiliary_max_tokens_param(MAX_SUMMARY_TOKENS),
+                max_tokens=MAX_SUMMARY_TOKENS,
             )
             return response.choices[0].message.content.strip()
+        except RuntimeError:
+            logging.warning("No auxiliary model available for session summarization")
+            return None
         except Exception as e:
             if attempt < max_retries - 1:
                 await asyncio.sleep(1 * (attempt + 1))
@@ -225,18 +221,23 @@ def session_search(
 
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
-        def _resolve_to_parent(session_id):
+        def _resolve_to_parent(session_id: str) -> str:
+            """Walk delegation chain to find the root parent session ID."""
             visited = set()
             sid = session_id
             while sid and sid not in visited:
                 visited.add(sid)
-                session = db.get_session(sid)
-                if not session:
-                    break
-                parent = session.get("parent_session_id")
-                if parent:
-                    sid = parent
-                else:
+                try:
+                    session = db.get_session(sid)
+                    if not session:
+                        break
+                    parent = session.get("parent_session_id")
+                    if parent:
+                        sid = parent
+                    else:
+                        break
+                except Exception as e:
+                    logging.debug("Error resolving parent for session %s: %s", sid, e)
                     break
             return sid
 
@@ -272,7 +273,8 @@ def session_search(
                 logging.warning(f"Failed to prepare session {session_id}: {e}")
 
         # Summarize all sessions in parallel
-        async def _summarize_all():
+        async def _summarize_all() -> List[Union[str, Exception]]:
+            """Summarize all sessions in parallel."""
             coros = [
                 _summarize_session(text, query, meta)
                 for _, _, text, meta in tasks
@@ -284,7 +286,14 @@ def session_search(
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 results = pool.submit(lambda: asyncio.run(_summarize_all())).result(timeout=60)
         except RuntimeError:
+            # No event loop running, create a new one
             results = asyncio.run(_summarize_all())
+        except concurrent.futures.TimeoutError:
+            logging.warning("Session summarization timed out after 60 seconds")
+            return json.dumps({
+                "success": False,
+                "error": "Session summarization timed out. Try a more specific query or reduce the limit.",
+            }, ensure_ascii=False)
 
         summaries = []
         for (session_id, match_info, _, _), result in zip(tasks, results):
@@ -314,8 +323,6 @@ def session_search(
 
 def check_session_search_requirements() -> bool:
     """Requires SQLite state database and an auxiliary text model."""
-    if _async_aux_client is None:
-        return False
     try:
         from hermes_state import DEFAULT_DB_PATH
         return DEFAULT_DB_PATH.parent.exists()

@@ -20,6 +20,7 @@ import contextlib
 import io
 import json
 import logging
+logger = logging.getLogger(__name__)
 import os
 import sys
 import time
@@ -125,8 +126,8 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
                 short = (preview[:55] + "...") if preview and len(preview) > 55 else (preview or "")
                 try:
                     spinner.print_above(f" {prefix}├─ 💭 \"{short}\"")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Spinner print_above failed: %s", e)
             # Don't relay thinking to gateway (too noisy for chat)
             return
 
@@ -147,8 +148,8 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
                 line += f"  \"{short}\""
             try:
                 spinner.print_above(line)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Spinner print_above failed: %s", e)
 
         if parent_cb:
             _batch.append(tool_name)
@@ -156,8 +157,8 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
                 summary = ", ".join(_batch)
                 try:
                     parent_cb("subagent_progress", f"🔀 {prefix}{summary}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Parent callback failed: %s", e)
                 _batch.clear()
 
     def _flush():
@@ -166,8 +167,8 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
             summary = ", ".join(_batch)
             try:
                 parent_cb("subagent_progress", f"🔀 {prefix}{summary}")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Parent callback flush failed: %s", e)
             _batch.clear()
 
     _callback._flush = _flush
@@ -183,17 +184,37 @@ def _run_single_child(
     max_iterations: int,
     parent_agent,
     task_count: int = 1,
+ feat/oss-forensics-skill-v2
     role: Optional[str] = None,
+=======
+    # Credential overrides from delegation config (provider:model resolution)
+    override_provider: Optional[str] = None,
+    override_base_url: Optional[str] = None,
+    override_api_key: Optional[str] = None,
+    override_api_mode: Optional[str] = None,
+ main
 ) -> Dict[str, Any]:
     """
     Spawn and run a single child agent. Called from within a thread.
     Returns a structured result dict.
+
+    When override_* params are set (from delegation config), the child uses
+    those credentials instead of inheriting from the parent.  This enables
+    routing subagents to a different provider:model pair (e.g. cheap/fast
+    model on OpenRouter while the parent runs on Nous Portal).
     """
     from run_agent import AIAgent
 
     child_start = time.monotonic()
 
-    child_toolsets = _strip_blocked_tools(toolsets or DEFAULT_TOOLSETS)
+    # When no explicit toolsets given, inherit from parent's enabled toolsets
+    # so disabled tools (e.g. web) don't leak to subagents.
+    if toolsets:
+        child_toolsets = _strip_blocked_tools(toolsets)
+    elif parent_agent and getattr(parent_agent, "enabled_toolsets", None):
+        child_toolsets = _strip_blocked_tools(parent_agent.enabled_toolsets)
+    else:
+        child_toolsets = _strip_blocked_tools(DEFAULT_TOOLSETS)
 
     child_prompt = _build_child_system_prompt(goal, context, role=role)
 
@@ -206,13 +227,27 @@ def _run_single_child(
         # Build progress callback to relay tool calls to parent display
         child_progress_cb = _build_child_progress_callback(task_index, parent_agent, task_count)
 
+        # Share the parent's iteration budget so subagent tool calls
+        # count toward the session-wide limit.
+        shared_budget = getattr(parent_agent, "iteration_budget", None)
+
+        # Resolve effective credentials: config override > parent inherit
+        effective_model = model or parent_agent.model
+        effective_provider = override_provider or getattr(parent_agent, "provider", None)
+        effective_base_url = override_base_url or parent_agent.base_url
+        effective_api_key = override_api_key or parent_api_key
+        effective_api_mode = override_api_mode or getattr(parent_agent, "api_mode", None)
+
         child = AIAgent(
-            base_url=parent_agent.base_url,
-            api_key=parent_api_key,
-            model=model or parent_agent.model,
-            provider=getattr(parent_agent, "provider", None),
-            api_mode=getattr(parent_agent, "api_mode", None),
+            base_url=effective_base_url,
+            api_key=effective_api_key,
+            model=effective_model,
+            provider=effective_provider,
+            api_mode=effective_api_mode,
             max_iterations=max_iterations,
+            max_tokens=getattr(parent_agent, "max_tokens", None),
+            reasoning_config=getattr(parent_agent, "reasoning_config", None),
+            prefill_messages=getattr(parent_agent, "prefill_messages", None),
             enabled_toolsets=child_toolsets,
             quiet_mode=True,
             ephemeral_system_prompt=child_prompt,
@@ -227,6 +262,7 @@ def _run_single_child(
             providers_order=parent_agent.providers_order,
             provider_sort=parent_agent.provider_sort,
             tool_progress_callback=child_progress_cb,
+            iteration_budget=shared_budget,
         )
 
         # Set delegation depth so children can't spawn grandchildren
@@ -245,8 +281,8 @@ def _run_single_child(
         if child_progress_cb and hasattr(child_progress_cb, '_flush'):
             try:
                 child_progress_cb._flush()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Progress callback flush failed: %s", e)
 
         duration = round(time.monotonic() - child_start, 2)
 
@@ -291,8 +327,8 @@ def _run_single_child(
         if hasattr(parent_agent, '_active_children'):
             try:
                 parent_agent._active_children.remove(child)
-            except (ValueError, UnboundLocalError):
-                pass
+            except (ValueError, UnboundLocalError) as e:
+                logger.debug("Could not remove child from active_children: %s", e)
 
 
 def delegate_task(
@@ -300,7 +336,6 @@ def delegate_task(
     context: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
-    model: Optional[str] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     parent_agent=None,
@@ -331,6 +366,16 @@ def delegate_task(
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     effective_max_iter = max_iterations or default_max_iter
+
+    # Resolve delegation credentials (provider:model pair).
+    # When delegation.provider is configured, this resolves the full credential
+    # bundle (base_url, api_key, api_mode) via the same runtime provider system
+    # used by CLI/gateway startup.  When unconfigured, returns None values so
+    # children inherit from the parent.
+    try:
+        creds = _resolve_delegation_credentials(cfg, parent_agent)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
 
     # Normalize to task list
     if tasks and isinstance(tasks, list):
@@ -363,11 +408,18 @@ def delegate_task(
             goal=t["goal"],
             context=t.get("context"),
             toolsets=t.get("toolsets") or toolsets,
-            model=model,
+            model=creds["model"],
             max_iterations=effective_max_iter,
             parent_agent=parent_agent,
             task_count=1,
+ feat/oss-forensics-skill-v2
             role=t.get("role") or role,
+
+            override_provider=creds["provider"],
+            override_base_url=creds["base_url"],
+            override_api_key=creds["api_key"],
+            override_api_mode=creds["api_mode"],
+ main
         )
         results.append(result)
     else:
@@ -389,11 +441,18 @@ def delegate_task(
                     goal=t["goal"],
                     context=t.get("context"),
                     toolsets=t.get("toolsets") or toolsets,
-                    model=model,
+                    model=creds["model"],
                     max_iterations=effective_max_iter,
                     parent_agent=parent_agent,
                     task_count=n_tasks,
+feat/oss-forensics-skill-v2
                     role=t.get("role") or role,
+=======
+                    override_provider=creds["provider"],
+                    override_base_url=creds["base_url"],
+                    override_api_key=creds["api_key"],
+                    override_api_mode=creds["api_mode"],
+ main
                 )
                 futures[future] = i
 
@@ -433,8 +492,8 @@ def delegate_task(
                 if spinner_ref and remaining > 0:
                     try:
                         spinner_ref.update_text(f"🔀 {remaining} task{'s' if remaining != 1 else ''} remaining")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Spinner update_text failed: %s", e)
 
         # Restore stdout/stderr in case redirect_stdout race left them as devnull
         sys.stdout = _saved_stdout
@@ -451,11 +510,78 @@ def delegate_task(
     }, ensure_ascii=False)
 
 
+def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+    """Resolve credentials for subagent delegation.
+
+    If ``delegation.provider`` is configured, resolves the full credential
+    bundle (base_url, api_key, api_mode, provider) via the runtime provider
+    system — the same path used by CLI/gateway startup.  This lets subagents
+    run on a completely different provider:model pair.
+
+    If no provider is configured, returns None values so the child inherits
+    everything from the parent agent.
+
+    Raises ValueError with a user-friendly message on credential failure.
+    """
+    configured_model = cfg.get("model") or None
+    configured_provider = cfg.get("provider") or None
+
+    if not configured_provider:
+        # No provider override — child inherits everything from parent
+        return {
+            "model": configured_model,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+
+    # Provider is configured — resolve full credentials
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        runtime = resolve_runtime_provider(requested=configured_provider)
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
+            f"Check that the provider is configured (API key set, valid provider name). "
+            f"Available providers: openrouter, nous, zai, kimi-coding, minimax."
+        ) from exc
+
+    api_key = runtime.get("api_key", "")
+    if not api_key:
+        raise ValueError(
+            f"Delegation provider '{configured_provider}' resolved but has no API key. "
+            f"Set the appropriate environment variable or run 'hermes login'."
+        )
+
+    return {
+        "model": configured_model,
+        "provider": runtime.get("provider"),
+        "base_url": runtime.get("base_url"),
+        "api_key": api_key,
+        "api_mode": runtime.get("api_mode"),
+    }
+
+
 def _load_config() -> dict:
-    """Load delegation config from CLI_CONFIG if available."""
+    """Load delegation config from CLI_CONFIG or persistent config.
+
+    Checks the runtime config (cli.py CLI_CONFIG) first, then falls back
+    to the persistent config (hermes_cli/config.py load_config()) so that
+    ``delegation.model`` / ``delegation.provider`` are picked up regardless
+    of the entry point (CLI, gateway, cron).
+    """
     try:
         from cli import CLI_CONFIG
-        return CLI_CONFIG.get("delegation", {})
+        cfg = CLI_CONFIG.get("delegation", {})
+        if cfg:
+            return cfg
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config
+        full = load_config()
+        return full.get("delegation", {})
     except Exception:
         return {}
 
@@ -515,7 +641,7 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Toolsets to enable for this subagent. "
-                    "Default: ['terminal', 'file', 'web']. "
+                    "Default: inherits your enabled toolsets. "
                     "Common patterns: ['terminal', 'file'] for code work, "
                     "['web'] for research, ['terminal', 'file', 'web'] for "
                     "full-stack tasks."
@@ -555,13 +681,6 @@ DELEGATE_TASK_SCHEMA = {
                     "When provided, top-level goal/context/toolsets/role are ignored."
                 ),
             },
-            "model": {
-                "type": "string",
-                "description": (
-                    "Model override for the subagent(s). Omit to use your "
-                    "same model. Use a cheaper/faster model for simple subtasks."
-                ),
-            },
             "max_iterations": {
                 "type": "integer",
                 "description": (
@@ -587,7 +706,6 @@ registry.register(
         context=args.get("context"),
         toolsets=args.get("toolsets"),
         tasks=args.get("tasks"),
-        model=args.get("model"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         parent_agent=kw.get("parent_agent")),
