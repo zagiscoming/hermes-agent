@@ -5,8 +5,8 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 """
 
 import json
+import logging
 import os
-import random
 import sys
 import threading
 import time
@@ -15,6 +15,49 @@ import time
 _RED = "\033[31m"
 _RESET = "\033[0m"
 
+logger = logging.getLogger(__name__)
+
+
+# =========================================================================
+# Skin-aware helpers (lazy import to avoid circular deps)
+# =========================================================================
+
+def _get_skin():
+    """Get the active skin config, or None if not available."""
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        return get_active_skin()
+    except Exception:
+        return None
+
+
+def get_skin_faces(key: str, default: list) -> list:
+    """Get spinner face list from active skin, falling back to default."""
+    skin = _get_skin()
+    if skin:
+        faces = skin.get_spinner_list(key)
+        if faces:
+            return faces
+    return default
+
+
+def get_skin_verbs() -> list:
+    """Get thinking verbs from active skin."""
+    skin = _get_skin()
+    if skin:
+        verbs = skin.get_spinner_list("thinking_verbs")
+        if verbs:
+            return verbs
+    return KawaiiSpinner.THINKING_VERBS
+
+
+def get_skin_tool_prefix() -> str:
+    """Get tool output prefix character from active skin."""
+    skin = _get_skin()
+    if skin:
+        return skin.tool_prefix
+    return "┊"
+
 
 # =========================================================================
 # Tool preview (one-line summary of a tool call's primary argument)
@@ -22,6 +65,8 @@ _RESET = "\033[0m"
 
 def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
     """Build a short preview of a tool call's primary argument for display."""
+    if not args:
+        return None
     primary_args = {
         "terminal": "command", "web_search": "query", "web_extract": "urls",
         "read_file": "path", "write_file": "path", "patch": "path",
@@ -31,6 +76,8 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
         "vision_analyze": "question", "mixture_of_agents": "user_prompt",
         "skill_view": "name", "skills_list": "category",
         "schedule_cronjob": "name",
+        "execute_code": "code", "delegate_task": "goal",
+        "clarify": "question", "skill_manage": "name",
     }
 
     if tool_name == "process":
@@ -97,7 +144,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int = 40) -> str:
 
     key = primary_args.get(tool_name)
     if not key:
-        for fallback_key in ("query", "text", "command", "path", "name", "prompt"):
+        for fallback_key in ("query", "text", "command", "path", "name", "prompt", "code", "goal"):
             if fallback_key in args:
                 key = fallback_key
                 break
@@ -161,6 +208,7 @@ class KawaiiSpinner:
         self.frame_idx = 0
         self.start_time = None
         self.last_line_len = 0
+        self._last_flush_time = 0.0  # Rate-limit flushes for patch_stdout compat
         # Capture stdout NOW, before any redirect_stdout(devnull) from
         # child agents can replace sys.stdout with a black hole.
         self._out = sys.stdout
@@ -175,15 +223,34 @@ class KawaiiSpinner:
             pass
 
     def _animate(self):
+        # Cache skin wings at start (avoid per-frame imports)
+        skin = _get_skin()
+        wings = skin.get_spinner_wings() if skin else []
+
         while self.running:
             if os.getenv("HERMES_SPINNER_PAUSE"):
                 time.sleep(0.1)
                 continue
             frame = self.spinner_frames[self.frame_idx % len(self.spinner_frames)]
             elapsed = time.time() - self.start_time
-            line = f"  {frame} {self.message} ({elapsed:.1f}s)"
+            if wings:
+                left, right = wings[self.frame_idx % len(wings)]
+                line = f"  {left} {frame} {self.message} {right} ({elapsed:.1f}s)"
+            else:
+                line = f"  {frame} {self.message} ({elapsed:.1f}s)"
             pad = max(self.last_line_len - len(line), 0)
-            self._write(f"\r{line}{' ' * pad}", end='', flush=True)
+            # Rate-limit flush() calls to avoid spinner spam under
+            # prompt_toolkit's patch_stdout.  Each flush() pushes a queue
+            # item that may trigger a separate run_in_terminal() call; if
+            # items are processed one-at-a-time the \r overwrite is lost
+            # and every frame appears on its own line.  By flushing at
+            # most every 0.4s we guarantee multiple \r-frames are batched
+            # into a single write, so the terminal collapses them correctly.
+            now = time.time()
+            should_flush = (now - self._last_flush_time) >= 0.4
+            self._write(f"\r{line}{' ' * pad}", end='', flush=should_flush)
+            if should_flush:
+                self._last_flush_time = now
             self.last_line_len = len(line)
             self.frame_idx += 1
             time.sleep(0.12)
@@ -198,6 +265,24 @@ class KawaiiSpinner:
 
     def update_text(self, new_message: str):
         self.message = new_message
+
+    def print_above(self, text: str):
+        """Print a line above the spinner without disrupting animation.
+
+        Clears the current spinner line, prints the text, and lets the
+        next animation tick redraw the spinner on the line below.
+        Thread-safe: uses the captured stdout reference (self._out).
+        Works inside redirect_stdout(devnull) because _write bypasses
+        sys.stdout and writes to the stdout captured at spinner creation.
+        """
+        if not self.running:
+            self._write(f"  {text}", flush=True)
+            return
+        # Clear spinner line with spaces (not \033[K) to avoid garbled escape
+        # codes when prompt_toolkit's patch_stdout is active — same approach
+        # as stop(). Then print text; spinner redraws on next tick.
+        blanks = ' ' * max(self.last_line_len + 5, 40)
+        self._write(f"\r{blanks}\r  {text}", flush=True)
 
     def stop(self, final_message: str = None):
         self.running = False
@@ -280,8 +365,17 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
             if exit_code is not None and exit_code != 0:
                 return True, f" [exit {exit_code}]"
         except (json.JSONDecodeError, TypeError, AttributeError):
-            pass
+            logger.debug("Could not parse terminal result as JSON for exit code check")
         return False, ""
+
+    # Memory-specific: distinguish "full" from real errors
+    if tool_name == "memory":
+        try:
+            data = json.loads(result)
+            if data.get("success") is False and "exceed the limit" in data.get("error", ""):
+                return True, " [full]"
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            logger.debug("Could not parse memory result as JSON for capacity check")
 
     # Generic heuristic for non-terminal tools
     lower = result[:500].lower()
@@ -303,6 +397,7 @@ def get_cute_tool_message(
     """
     dur = f"{duration:.1f}s"
     is_failure, failure_suffix = _detect_tool_failure(tool_name, result)
+    skin_prefix = get_skin_tool_prefix()
 
     def _trunc(s, n=40):
         s = str(s)
@@ -313,7 +408,9 @@ def get_cute_tool_message(
         return ("..." + p[-(n-3):]) if len(p) > n else p
 
     def _wrap(line: str) -> str:
-        """Append failure suffix when the tool failed."""
+        """Apply skin tool prefix and failure suffix."""
+        if skin_prefix != "┊":
+            line = line.replace("┊", skin_prefix, 1)
         if not is_failure:
             return line
         return f"{line}{failure_suffix}"

@@ -14,10 +14,13 @@ Usage:
 
 import logging
 import os
+import shutil
 import sys
 import json
 import atexit
 import uuid
+import textwrap
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -42,11 +45,17 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.widgets import TextArea
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit import print_formatted_text as _pt_print
 from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
+try:
+    from prompt_toolkit.cursor_shapes import CursorShape
+    _STEADY_CURSOR = CursorShape.BLOCK  # Non-blinking block cursor
+except (ImportError, AttributeError):
+    _STEADY_CURSOR = None
 import threading
 import queue
+
+_COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback
@@ -107,7 +116,7 @@ def _parse_reasoning_config(effort: str) -> dict | None:
     """Parse a reasoning effort level into an OpenRouter reasoning config dict.
     
     Valid levels: "xhigh", "high", "medium", "low", "minimal", "none".
-    Returns None to use the default (xhigh), or a config dict to override.
+    Returns None to use the default (medium), or a config dict to override.
     """
     if not effort or not effort.strip():
         return None
@@ -117,7 +126,7 @@ def _parse_reasoning_config(effort: str) -> dict | None:
     valid = ("xhigh", "high", "medium", "low", "minimal")
     if effort in valid:
         return {"enabled": True, "effort": effort}
-    logger.warning("Unknown reasoning_effort '%s', using default (xhigh)", effort)
+    logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
     return None
 
 
@@ -157,9 +166,12 @@ def load_cli_config() -> Dict[str, Any]:
             "docker_image": "python:3.11",
             "singularity_image": "docker://python:3.11",
             "modal_image": "python:3.11",
+            "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+            "docker_volumes": [],  # host:container volume mounts for Docker backend
         },
         "browser": {
             "inactivity_timeout": 120,  # Auto-cleanup inactive browser sessions after 2 min
+            "record_sessions": False,  # Auto-record browser sessions as WebM videos
         },
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
@@ -167,7 +179,7 @@ def load_cli_config() -> Dict[str, Any]:
             "summary_model": "google/gemini-3-flash-preview",  # Fast/cheap model for summaries
         },
         "agent": {
-            "max_turns": 60,  # Default max tool-calling iterations
+            "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
             "verbose": False,
             "system_prompt": "",
             "prefill_messages_file": "",
@@ -192,6 +204,9 @@ def load_cli_config() -> Dict[str, Any]:
         "toolsets": ["all"],
         "display": {
             "compact": False,
+            "resume_display": "full",
+            "show_reasoning": False,
+            "skin": "default",
         },
         "clarify": {
             "timeout": 120,  # Seconds to wait for a clarify answer before auto-proceeding
@@ -203,6 +218,8 @@ def load_cli_config() -> Dict[str, Any]:
         "delegation": {
             "max_iterations": 45,  # Max tool-calling turns per child agent
             "default_toolsets": ["terminal", "file", "web"],  # Default toolsets for subagents
+            "model": "",       # Subagent model override (empty = inherit parent model)
+            "provider": "",    # Subagent provider override (empty = inherit parent provider)
         },
     }
     
@@ -229,7 +246,8 @@ def load_cli_config() -> Dict[str, Any]:
                     # Old format: model is a dict with default/base_url
                     defaults["model"].update(file_config["model"])
             
-            # Deep merge other keys with defaults
+            # Deep merge file_config into defaults.
+            # First: merge keys that exist in both (deep-merge dicts, overwrite scalars)
             for key in defaults:
                 if key == "model":
                     continue  # Already handled above
@@ -239,8 +257,19 @@ def load_cli_config() -> Dict[str, Any]:
                     else:
                         defaults[key] = file_config[key]
             
-            # Handle root-level max_turns (backwards compat) - copy to agent.max_turns
-            if "max_turns" in file_config and "agent" not in file_config:
+            # Second: carry over keys from file_config that aren't in defaults
+            # (e.g. platform_toolsets, provider_routing, memory, honcho, etc.)
+            for key in file_config:
+                if key not in defaults and key != "model":
+                    defaults[key] = file_config[key]
+            
+            # Handle legacy root-level max_turns (backwards compat) - copy to
+            # agent.max_turns whenever the nested key is missing.
+            agent_file_config = file_config.get("agent")
+            if "max_turns" in file_config and not (
+                isinstance(agent_file_config, dict)
+                and agent_file_config.get("max_turns") is not None
+            ):
                 defaults["agent"]["max_turns"] = file_config["max_turns"]
         except Exception as e:
             logger.warning("Failed to load cli-config.yaml: %s", e)
@@ -276,17 +305,19 @@ def load_cli_config() -> Dict[str, Any]:
         "docker_image": "TERMINAL_DOCKER_IMAGE",
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
+        "daytona_image": "TERMINAL_DAYTONA_IMAGE",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal -- ignored for local/ssh)
+        # Container resource config (docker, singularity, modal, daytona -- ignored for local/ssh)
         "container_cpu": "TERMINAL_CONTAINER_CPU",
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
         "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
         "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
+        "sandbox_dir": "TERMINAL_SANDBOX_DIR",
         # Sudo support (works with all backends)
         "sudo_password": "SUDO_PASSWORD",
     }
@@ -322,17 +353,56 @@ def load_cli_config() -> Dict[str, Any]:
         "enabled": "CONTEXT_COMPRESSION_ENABLED",
         "threshold": "CONTEXT_COMPRESSION_THRESHOLD",
         "summary_model": "CONTEXT_COMPRESSION_MODEL",
+        "summary_provider": "CONTEXT_COMPRESSION_PROVIDER",
     }
     
     for config_key, env_var in compression_env_mappings.items():
         if config_key in compression_config:
             os.environ[env_var] = str(compression_config[config_key])
     
+    # Apply auxiliary model overrides to environment variables.
+    # Vision and web_extract each have their own provider + model pair.
+    # (Compression is handled in the compression section above.)
+    # Only set env vars for non-empty / non-default values so auto-detection
+    # still works.
+    auxiliary_config = defaults.get("auxiliary", {})
+    auxiliary_task_env = {
+        # config key → (provider env var, model env var)
+        "vision":      ("AUXILIARY_VISION_PROVIDER",      "AUXILIARY_VISION_MODEL"),
+        "web_extract": ("AUXILIARY_WEB_EXTRACT_PROVIDER",  "AUXILIARY_WEB_EXTRACT_MODEL"),
+    }
+    
+    for task_key, (prov_env, model_env) in auxiliary_task_env.items():
+        task_cfg = auxiliary_config.get(task_key, {})
+        if not isinstance(task_cfg, dict):
+            continue
+        prov = str(task_cfg.get("provider", "")).strip()
+        model = str(task_cfg.get("model", "")).strip()
+        if prov and prov != "auto":
+            os.environ[prov_env] = prov
+        if model:
+            os.environ[model_env] = model
+    
+    # Security settings
+    security_config = defaults.get("security", {})
+    if isinstance(security_config, dict):
+        redact = security_config.get("redact_secrets")
+        if redact is not None:
+            os.environ["HERMES_REDACT_SECRETS"] = str(redact).lower()
+
     return defaults
 
 # Load configuration at module startup
 CLI_CONFIG = load_cli_config()
 
+# Initialize the skin engine from config
+try:
+    from hermes_cli.skin_engine import init_skin_from_config
+    init_skin_from_config(CLI_CONFIG)
+except Exception:
+    pass  # Skin engine is optional — default skin used if unavailable
+
+from rich import box as rich_box
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -346,7 +416,7 @@ from model_tools import get_tool_definitions, get_toolset_for_tool
 # Extracted CLI modules (Phase 3)
 from hermes_cli.banner import (
     cprint as _cprint, _GOLD, _BOLD, _DIM, _RST,
-    VERSION, HERMES_AGENT_LOGO, HERMES_CADUCEUS, COMPACT_BANNER,
+    VERSION, RELEASE_DATE, HERMES_AGENT_LOGO, HERMES_CADUCEUS, COMPACT_BANNER,
     get_available_skills as _get_available_skills,
     build_welcome_banner,
 )
@@ -379,6 +449,233 @@ def _run_cleanup():
         _cleanup_all_browsers()
     except Exception:
         pass
+    try:
+        from tools.mcp_tool import shutdown_mcp_servers
+        shutdown_mcp_servers()
+    except Exception:
+        pass
+
+
+# =============================================================================
+# Git Worktree Isolation (#652)
+# =============================================================================
+
+# Tracks the active worktree for cleanup on exit
+_active_worktree: Optional[Dict[str, str]] = None
+
+
+def _git_repo_root() -> Optional[str]:
+    """Return the git repo root for CWD, or None if not in a repo."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
+    """Create an isolated git worktree for this CLI session.
+
+    Returns a dict with worktree metadata on success, None on failure.
+    The dict contains: path, branch, repo_root.
+    """
+    import subprocess
+
+    repo_root = repo_root or _git_repo_root()
+    if not repo_root:
+        print("\033[31m✗ --worktree requires being inside a git repository.\033[0m")
+        print("  cd into your project repo first, then run hermes -w")
+        return None
+
+    short_id = uuid.uuid4().hex[:8]
+    wt_name = f"hermes-{short_id}"
+    branch_name = f"hermes/{wt_name}"
+
+    worktrees_dir = Path(repo_root) / ".worktrees"
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
+
+    wt_path = worktrees_dir / wt_name
+
+    # Ensure .worktrees/ is in .gitignore
+    gitignore = Path(repo_root) / ".gitignore"
+    _ignore_entry = ".worktrees/"
+    try:
+        existing = gitignore.read_text() if gitignore.exists() else ""
+        if _ignore_entry not in existing.splitlines():
+            with open(gitignore, "a") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write(f"{_ignore_entry}\n")
+    except Exception as e:
+        logger.debug("Could not update .gitignore: %s", e)
+
+    # Create the worktree
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "add", str(wt_path), "-b", branch_name, "HEAD"],
+            capture_output=True, text=True, timeout=30, cwd=repo_root,
+        )
+        if result.returncode != 0:
+            print(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
+            return None
+    except Exception as e:
+        print(f"\033[31m✗ Failed to create worktree: {e}\033[0m")
+        return None
+
+    # Copy files listed in .worktreeinclude (gitignored files the agent needs)
+    include_file = Path(repo_root) / ".worktreeinclude"
+    if include_file.exists():
+        try:
+            for line in include_file.read_text().splitlines():
+                entry = line.strip()
+                if not entry or entry.startswith("#"):
+                    continue
+                src = Path(repo_root) / entry
+                dst = wt_path / entry
+                if src.is_file():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(src), str(dst))
+                elif src.is_dir():
+                    # Symlink directories (faster, saves disk)
+                    if not dst.exists():
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        os.symlink(str(src.resolve()), str(dst))
+        except Exception as e:
+            logger.debug("Error copying .worktreeinclude entries: %s", e)
+
+    info = {
+        "path": str(wt_path),
+        "branch": branch_name,
+        "repo_root": repo_root,
+    }
+
+    print(f"\033[32m✓ Worktree created:\033[0m {wt_path}")
+    print(f"  Branch: {branch_name}")
+
+    return info
+
+
+def _cleanup_worktree(info: Dict[str, str] = None) -> None:
+    """Remove a worktree and its branch on exit.
+
+    If the worktree has uncommitted changes, warn and keep it.
+    """
+    global _active_worktree
+    info = info or _active_worktree
+    if not info:
+        return
+
+    import subprocess
+
+    wt_path = info["path"]
+    branch = info["branch"]
+    repo_root = info["repo_root"]
+
+    if not Path(wt_path).exists():
+        return
+
+    # Check for uncommitted changes
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10, cwd=wt_path,
+        )
+        has_changes = bool(status.stdout.strip())
+    except Exception:
+        has_changes = True  # Assume dirty on error — don't delete
+
+    if has_changes:
+        print(f"\n\033[33m⚠ Worktree has uncommitted changes, keeping: {wt_path}\033[0m")
+        print(f"  To clean up manually: git worktree remove {wt_path}")
+        _active_worktree = None
+        return
+
+    # Remove worktree
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", wt_path, "--force"],
+            capture_output=True, text=True, timeout=15, cwd=repo_root,
+        )
+    except Exception as e:
+        logger.debug("Failed to remove worktree: %s", e)
+
+    # Delete the branch (only if it was never pushed / has no upstream)
+    try:
+        subprocess.run(
+            ["git", "branch", "-D", branch],
+            capture_output=True, text=True, timeout=10, cwd=repo_root,
+        )
+    except Exception as e:
+        logger.debug("Failed to delete branch %s: %s", branch, e)
+
+    _active_worktree = None
+    print(f"\033[32m✓ Worktree cleaned up: {wt_path}\033[0m")
+
+
+def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
+    """Remove worktrees older than max_age_hours that have no uncommitted changes.
+
+    Runs silently on startup to clean up after crashed/killed sessions.
+    """
+    import subprocess
+    import time
+
+    worktrees_dir = Path(repo_root) / ".worktrees"
+    if not worktrees_dir.exists():
+        return
+
+    now = time.time()
+    cutoff = now - (max_age_hours * 3600)
+
+    for entry in worktrees_dir.iterdir():
+        if not entry.is_dir() or not entry.name.startswith("hermes-"):
+            continue
+
+        # Check age
+        try:
+            mtime = entry.stat().st_mtime
+            if mtime > cutoff:
+                continue  # Too recent — skip
+        except Exception:
+            continue
+
+        # Check for uncommitted changes
+        try:
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, timeout=5, cwd=str(entry),
+            )
+            if status.stdout.strip():
+                continue  # Has changes — skip
+        except Exception:
+            continue  # Can't check — skip
+
+        # Safe to remove
+        try:
+            branch_result = subprocess.run(
+                ["git", "branch", "--show-current"],
+                capture_output=True, text=True, timeout=5, cwd=str(entry),
+            )
+            branch = branch_result.stdout.strip()
+
+            subprocess.run(
+                ["git", "worktree", "remove", str(entry), "--force"],
+                capture_output=True, text=True, timeout=15, cwd=repo_root,
+            )
+            if branch:
+                subprocess.run(
+                    ["git", "branch", "-D", branch],
+                    capture_output=True, text=True, timeout=10, cwd=repo_root,
+                )
+            logger.debug("Pruned stale worktree: %s", entry.name)
+        except Exception as e:
+            logger.debug("Failed to prune worktree %s: %s", entry.name, e)
 
 # ============================================================================
 # ASCII Art & Branding
@@ -424,6 +721,8 @@ class ChatConsole:
     def print(self, *args, **kwargs):
         self._buffer.seek(0)
         self._buffer.truncate()
+        # Read terminal width at render time so panels adapt to current size
+        self._inner.width = shutil.get_terminal_size((80, 24)).columns
         self._inner.print(*args, **kwargs)
         output = self._buffer.getvalue()
         for line in output.rstrip("\n").split("\n"):
@@ -455,12 +754,33 @@ HERMES_CADUCEUS = """[#CD7F32]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⣀⣀�
 [#B8860B]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[/]"""
 
 # Compact banner for smaller terminals (fallback)
+# Note: built dynamically by _build_compact_banner() to fit terminal width
 COMPACT_BANNER = """
 [bold #FFD700]╔══════════════════════════════════════════════════════════════╗[/]
 [bold #FFD700]║[/]  [#FFBF00]⚕ NOUS HERMES[/] [dim #B8860B]- AI Agent Framework[/]              [bold #FFD700]║[/]
 [bold #FFD700]║[/]  [#CD7F32]Messenger of the Digital Gods[/]    [dim #B8860B]Nous Research[/]   [bold #FFD700]║[/]
 [bold #FFD700]╚══════════════════════════════════════════════════════════════╝[/]
 """
+
+
+def _build_compact_banner() -> str:
+    """Build a compact banner that fits the current terminal width."""
+    w = min(shutil.get_terminal_size().columns - 2, 64)
+    if w < 30:
+        return "\n[#FFBF00]⚕ NOUS HERMES[/] [dim #B8860B]- Nous Research[/]\n"
+    inner = w - 2  # inside the box border
+    bar = "═" * w
+    line1 = "⚕ NOUS HERMES - AI Agent Framework"
+    line2 = "Messenger of the Digital Gods  ·  Nous Research"
+    # Truncate and pad to fit
+    line1 = line1[:inner - 2].ljust(inner - 2)
+    line2 = line2[:inner - 2].ljust(inner - 2)
+    return (
+        f"\n[bold #FFD700]╔{bar}╗[/]\n"
+        f"[bold #FFD700]║[/] [#FFBF00]{line1}[/] [bold #FFD700]║[/]\n"
+        f"[bold #FFD700]║[/] [dim #B8860B]{line2}[/] [bold #FFD700]║[/]\n"
+        f"[bold #FFD700]╚{bar}╝[/]\n"
+    )
 
 
 def _get_available_skills() -> Dict[str, List[str]]:
@@ -495,7 +815,18 @@ def _get_available_skills() -> Dict[str, List[str]]:
     return skills_by_category
 
 
-def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dict] = None, enabled_toolsets: List[str] = None, session_id: str = None):
+def _format_context_length(tokens: int) -> str:
+    """Format a token count for display (e.g. 128000 → '128K', 1048576 → '1M')."""
+    if tokens >= 1_000_000:
+        val = tokens / 1_000_000
+        return f"{val:g}M"
+    elif tokens >= 1_000:
+        val = tokens / 1_000
+        return f"{val:g}K"
+    return str(tokens)
+
+
+def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dict] = None, enabled_toolsets: List[str] = None, session_id: str = None, context_length: int = None):
     """
     Build and print a Claude Code-style welcome banner with caduceus on left and info on right.
     
@@ -506,6 +837,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dic
         tools: List of tool definitions
         enabled_toolsets: List of enabled toolset names
         session_id: Unique session identifier for logging
+        context_length: Model's context window size in tokens
     """
     from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
     
@@ -524,24 +856,43 @@ def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dic
     layout_table.add_column("right", justify="left")
     
     # Build left content: caduceus + model info
-    left_lines = ["", HERMES_CADUCEUS, ""]
+    # Resolve skin colors for the banner
+    try:
+        from hermes_cli.skin_engine import get_active_skin
+        _bskin = get_active_skin()
+        _accent = _bskin.get_color("banner_accent", "#FFBF00")
+        _dim = _bskin.get_color("banner_dim", "#B8860B")
+        _text = _bskin.get_color("banner_text", "#FFF8DC")
+        _session_c = _bskin.get_color("session_border", "#8B8682")
+        _title_c = _bskin.get_color("banner_title", "#FFD700")
+        _border_c = _bskin.get_color("banner_border", "#CD7F32")
+        _agent_name = _bskin.get_branding("agent_name", "Hermes Agent")
+    except Exception:
+        _bskin = None
+        _accent, _dim, _text = "#FFBF00", "#B8860B", "#FFF8DC"
+        _session_c, _title_c, _border_c = "#8B8682", "#FFD700", "#CD7F32"
+        _agent_name = "Hermes Agent"
+
+    _hero = _bskin.banner_hero if hasattr(_bskin, 'banner_hero') and _bskin.banner_hero else HERMES_CADUCEUS
+    left_lines = ["", _hero, ""]
     
     # Shorten model name for display
     model_short = model.split("/")[-1] if "/" in model else model
     if len(model_short) > 28:
         model_short = model_short[:25] + "..."
     
-    left_lines.append(f"[#FFBF00]{model_short}[/] [dim #B8860B]·[/] [dim #B8860B]Nous Research[/]")
-    left_lines.append(f"[dim #B8860B]{cwd}[/]")
+    ctx_str = f" [dim {_dim}]·[/] [dim {_dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
+    left_lines.append(f"[{_accent}]{model_short}[/]{ctx_str} [dim {_dim}]·[/] [dim {_dim}]Nous Research[/]")
+    left_lines.append(f"[dim {_dim}]{cwd}[/]")
     
     # Add session ID if provided
     if session_id:
-        left_lines.append(f"[dim #8B8682]Session: {session_id}[/]")
+        left_lines.append(f"[dim {_session_c}]Session: {session_id}[/]")
     left_content = "\n".join(left_lines)
     
     # Build right content: tools list grouped by toolset
     right_lines = []
-    right_lines.append("[bold #FFBF00]Available Tools[/]")
+    right_lines.append(f"[bold {_accent}]Available Tools[/]")
     
     # Group tools by toolset (include all possible tools, both enabled and disabled)
     toolsets_dict = {}
@@ -578,7 +929,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dic
             if name in disabled_tools:
                 colored_names.append(f"[red]{name}[/]")
             else:
-                colored_names.append(f"[#FFF8DC]{name}[/]")
+                colored_names.append(f"[{_text}]{name}[/]")
         
         tools_str = ", ".join(colored_names)
         # Truncate if too long (accounting for markup)
@@ -600,18 +951,18 @@ def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dic
                 elif name in disabled_tools:
                     colored_names.append(f"[red]{name}[/]")
                 else:
-                    colored_names.append(f"[#FFF8DC]{name}[/]")
+                    colored_names.append(f"[{_text}]{name}[/]")
             tools_str = ", ".join(colored_names)
         
-        right_lines.append(f"[dim #B8860B]{toolset}:[/] {tools_str}")
+        right_lines.append(f"[dim {_dim}]{toolset}:[/] {tools_str}")
     
     if remaining_toolsets > 0:
-        right_lines.append(f"[dim #B8860B](and {remaining_toolsets} more toolsets...)[/]")
+        right_lines.append(f"[dim {_dim}](and {remaining_toolsets} more toolsets...)[/]")
     
     right_lines.append("")
     
     # Add skills section
-    right_lines.append("[bold #FFBF00]Available Skills[/]")
+    right_lines.append(f"[bold {_accent}]Available Skills[/]")
     skills_by_category = _get_available_skills()
     total_skills = sum(len(s) for s in skills_by_category.values())
     
@@ -627,12 +978,12 @@ def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dic
             # Truncate if still too long
             if len(skills_str) > 50:
                 skills_str = skills_str[:47] + "..."
-            right_lines.append(f"[dim #B8860B]{category}:[/] [#FFF8DC]{skills_str}[/]")
+            right_lines.append(f"[dim {_dim}]{category}:[/] [{_text}]{skills_str}[/]")
     else:
-        right_lines.append("[dim #B8860B]No skills installed[/]")
+        right_lines.append(f"[dim {_dim}]No skills installed[/]")
     
     right_lines.append("")
-    right_lines.append(f"[dim #B8860B]{len(tools)} tools · {total_skills} skills · /help for commands[/]")
+    right_lines.append(f"[dim {_dim}]{len(tools)} tools · {total_skills} skills · /help for commands[/]")
     
     right_content = "\n".join(right_lines)
     
@@ -642,64 +993,30 @@ def build_welcome_banner(console: Console, model: str, cwd: str, tools: List[dic
     # Wrap in a panel with the title
     outer_panel = Panel(
         layout_table,
-        title=f"[bold #FFD700]Hermes Agent {VERSION}[/]",
-        border_style="#CD7F32",
+        title=f"[bold {_title_c}]{_agent_name} v{VERSION} ({RELEASE_DATE})[/]",
+        border_style=_border_c,
         padding=(0, 2),
     )
     
-    # Print the big HERMES-AGENT logo first (no panel wrapper for full width)
+    # Print the big logo — use skin's custom logo if available
     console.print()
-    console.print(HERMES_AGENT_LOGO)
-    console.print()
+    term_width = shutil.get_terminal_size().columns
+    if term_width >= 95:
+        _logo = _bskin.banner_logo if hasattr(_bskin, 'banner_logo') and _bskin.banner_logo else HERMES_AGENT_LOGO
+        console.print(_logo)
+        console.print()
     
     # Print the panel with caduceus and info
     console.print(outer_panel)
 
 
 # ============================================================================
-# CLI Commands
+# Skill Slash Commands — dynamic commands generated from installed skills
 # ============================================================================
 
-COMMANDS = {
-    "/help": "Show this help message",
-    "/tools": "List available tools",
-    "/toolsets": "List available toolsets",
-    "/model": "Show or change the current model",
-    "/prompt": "View/set custom system prompt",
-    "/personality": "Set a predefined personality",
-    "/clear": "Clear screen and reset conversation (fresh start)",
-    "/history": "Show conversation history",
-    "/new": "Start a new conversation (reset history)",
-    "/reset": "Reset conversation only (keep screen)",
-    "/retry": "Retry the last message (resend to agent)",
-    "/undo": "Remove the last user/assistant exchange",
-    "/save": "Save the current conversation",
-    "/config": "Show current configuration",
-    "/cron": "Manage scheduled tasks (list, add, remove)",
-    "/skills": "Search, install, inspect, or manage skills from online registries",
-    "/platforms": "Show gateway/messaging platform status",
-    "/quit": "Exit the CLI (also: /exit, /q)",
-}
+from agent.skill_commands import scan_skill_commands, get_skill_commands, build_skill_invocation_message
 
-
-class SlashCommandCompleter(Completer):
-    """Autocomplete for /commands in the input area."""
-
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        # Only complete at the start of input, after /
-        if not text.startswith("/"):
-            return
-        word = text[1:]  # strip the leading /
-        for cmd, desc in COMMANDS.items():
-            cmd_name = cmd[1:]  # strip leading / from key
-            if cmd_name.startswith(word):
-                yield Completion(
-                    cmd_name,
-                    start_position=-len(word),
-                    display=cmd,
-                    display_meta=desc,
-                )
+_skill_commands = scan_skill_commands()
 
 
 def save_config_value(key_path: str, value: any) -> bool:
@@ -746,6 +1063,12 @@ def save_config_value(key_path: str, value: any) -> bool:
         with open(config_path, 'w') as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
         
+        # Enforce owner-only permissions on config files (contain API keys)
+        try:
+            os.chmod(config_path, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+        
         return True
     except Exception as e:
         logger.error("Failed to save config: %s", e)
@@ -775,6 +1098,8 @@ class HermesCLI:
         verbose: bool = False,
         compact: bool = False,
         resume: str = None,
+        checkpoints: bool = False,
+        pass_session_id: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -782,57 +1107,80 @@ class HermesCLI:
         Args:
             model: Model to use (default: from env or claude-sonnet)
             toolsets: List of toolsets to enable (default: all)
-            provider: Inference provider ("auto", "openrouter", "nous")
+            provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
-            max_turns: Maximum tool-calling iterations (default: 60)
+            max_turns: Maximum tool-calling iterations shared with subagents (default: 90)
             verbose: Enable verbose logging
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
+            pass_session_id: Include the session ID in the agent's system prompt
         """
         # Initialize Rich console
         self.console = Console()
+        self.config = CLI_CONFIG
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         self.tool_progress_mode = CLI_CONFIG["display"].get("tool_progress", "all")
+        # resume_display: "full" (show history) | "minimal" (one-liner only)
+        self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
+        # bell_on_complete: play terminal bell (\a) when agent finishes a response
+        self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
+        # show_reasoning: display model thinking/reasoning before the response
+        self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", False)
         self.verbose = verbose if verbose is not None else (self.tool_progress_mode == "verbose")
         
         # Configuration - priority: CLI args > env vars > config file
-        # Model can come from: CLI arg, LLM_MODEL env, OPENAI_MODEL env (custom endpoint), or config
-        self.model = model or os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or CLI_CONFIG["model"]["default"]
-        
-        # Base URL: custom endpoint (OPENAI_BASE_URL) takes precedence over OpenRouter
-        self.base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", CLI_CONFIG["model"]["base_url"])
-        
-        # API key: custom endpoint (OPENAI_API_KEY) takes precedence over OpenRouter
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        # Model comes from: CLI arg or config.yaml (single source of truth).
+        # LLM_MODEL/OPENAI_MODEL env vars are NOT checked — config.yaml is
+        # authoritative.  This avoids conflicts in multi-agent setups where
+        # env vars would stomp each other.
+        _model_config = CLI_CONFIG.get("model", {})
+        _config_model = _model_config.get("default", "") if isinstance(_model_config, dict) else (_model_config or "")
+        self.model = model or _config_model or "anthropic/claude-opus-4.6"
+        # Track whether model was explicitly chosen by the user or fell back
+        # to the global default.  Provider-specific normalisation may override
+        # the default silently but should warn when overriding an explicit choice.
+        self._model_is_default = not model
 
-        # Provider resolution: determines whether to use OAuth credentials or env var keys
-        from hermes_cli.auth import resolve_provider
+        self._explicit_api_key = api_key
+        self._explicit_base_url = base_url
+
+        # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
             provider
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or CLI_CONFIG["model"].get("provider")
             or "auto"
         )
-        self.provider = resolve_provider(
-            self.requested_provider,
-            explicit_api_key=api_key,
-            explicit_base_url=base_url,
+        self._provider_source: Optional[str] = None
+        self.provider = self.requested_provider
+        self.api_mode = "chat_completions"
+        self.base_url = (
+            base_url
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("OPENROUTER_BASE_URL", CLI_CONFIG["model"]["base_url"])
         )
+        # Match key to resolved base_url: OpenRouter URL → prefer OPENROUTER_API_KEY,
+        # custom endpoint → prefer OPENAI_API_KEY (issue #560).
+        # Note: _ensure_runtime_credentials() re-resolves this before first use.
+        if "openrouter.ai" in self.base_url:
+            self.api_key = api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+        else:
+            self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
         self._nous_key_expires_at: Optional[str] = None
         self._nous_key_source: Optional[str] = None
-        # Max turns priority: CLI arg > env var > config file (agent.max_turns or root max_turns) > default
-        if max_turns is not None:
+        # Max turns priority: CLI arg > config file > env var > default
+        if max_turns is not None:  # CLI arg was explicitly set
             self.max_turns = max_turns
-        elif os.getenv("HERMES_MAX_ITERATIONS"):
-            self.max_turns = int(os.getenv("HERMES_MAX_ITERATIONS"))
         elif CLI_CONFIG["agent"].get("max_turns"):
             self.max_turns = CLI_CONFIG["agent"]["max_turns"]
         elif CLI_CONFIG.get("max_turns"):  # Backwards compat: root-level max_turns
             self.max_turns = CLI_CONFIG["max_turns"]
+        elif os.getenv("HERMES_MAX_ITERATIONS"):
+            self.max_turns = int(os.getenv("HERMES_MAX_ITERATIONS"))
         else:
-            self.max_turns = 60
+            self.max_turns = 90
         
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
@@ -841,6 +1189,14 @@ class HermesCLI:
             invalid = [t for t in toolsets if not validate_toolset(t)]
             if invalid:
                 self.console.print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
+        
+        # Filesystem checkpoints: CLI flag > config
+        cp_cfg = CLI_CONFIG.get("checkpoints", {})
+        if isinstance(cp_cfg, bool):
+            cp_cfg = {"enabled": cp_cfg}
+        self.checkpoints_enabled = checkpoints or cp_cfg.get("enabled", False)
+        self.checkpoint_max_snapshots = cp_cfg.get("max_snapshots", 50)
+        self.pass_session_id = pass_session_id
         
         # Ephemeral system prompt: env var takes precedence, then config
         self.system_prompt = (
@@ -859,6 +1215,19 @@ class HermesCLI:
             CLI_CONFIG["agent"].get("reasoning_effort", "")
         )
         
+        # OpenRouter provider routing preferences
+        pr = CLI_CONFIG.get("provider_routing", {}) or {}
+        self._provider_sort = pr.get("sort")
+        self._providers_only = pr.get("only")
+        self._providers_ignore = pr.get("ignore")
+        self._providers_order = pr.get("order")
+        self._provider_require_params = pr.get("require_parameters", False)
+        self._provider_data_collection = pr.get("data_collection")
+        
+        # Fallback model config — tried when primary provider fails after retries
+        fb = CLI_CONFIG.get("fallback_model") or {}
+        self._fallback_model = fb if fb.get("provider") and fb.get("model") else None
+
         # Agent will be initialized on first use
         self.agent: Optional[AIAgent] = None
         self._app = None  # prompt_toolkit Application (set in run())
@@ -867,6 +1236,16 @@ class HermesCLI:
         self.conversation_history: List[Dict[str, Any]] = []
         self.session_start = datetime.now()
         self._resumed = False
+        # Initialize SQLite session store early so /title works before first message
+        self._session_db = None
+        try:
+            from hermes_state import SessionDB
+            self._session_db = SessionDB()
+        except Exception:
+            pass
+        
+        # Deferred title: stored in memory until the session is created in the DB
+        self._pending_title: Optional[str] = None
         
         # Session ID: reuse existing one when resuming, otherwise generate fresh
         if resume:
@@ -879,48 +1258,172 @@ class HermesCLI:
         
         # History file for persistent input recall across sessions
         self._history_file = Path.home() / ".hermes_history"
+        self._last_invalidate: float = 0.0  # throttle UI repaints
+        self._spinner_text: str = ""  # thinking spinner text for TUI
+        self._command_running = False
+        self._command_status = ""
+
+        # Background task tracking: {task_id: threading.Thread}
+        self._background_tasks: Dict[str, threading.Thread] = {}
+        self._background_task_counter = 0
+
+    def _invalidate(self, min_interval: float = 0.25) -> None:
+        """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
+        import time as _time
+        now = _time.monotonic()
+        if hasattr(self, "_app") and self._app and (now - self._last_invalidate) >= min_interval:
+            self._last_invalidate = now
+            self._app.invalidate()
+
+    def _normalize_model_for_provider(self, resolved_provider: str) -> bool:
+        """Strip provider prefixes and swap the default model for Codex.
+
+        When the resolved provider is ``openai-codex``:
+
+        1. Strip any ``provider/`` prefix (the Codex Responses API only
+           accepts bare model slugs like ``gpt-5.4``, not ``openai/gpt-5.4``).
+        2. If the active model is still the *untouched default* (user never
+           explicitly chose a model), replace it with a Codex-compatible
+           default so the first session doesn't immediately error.
+
+        If the user explicitly chose a model — *any* model — we trust them
+        and let the API be the judge.  No allowlists, no slug checks.
+
+        Returns True when the active model was changed.
+        """
+        if resolved_provider != "openai-codex":
+            return False
+
+        current_model = (self.model or "").strip()
+        changed = False
+
+        # 1. Strip provider prefix ("openai/gpt-5.4" → "gpt-5.4")
+        if "/" in current_model:
+            slug = current_model.split("/", 1)[1]
+            if not self._model_is_default:
+                self.console.print(
+                    f"[yellow]⚠️  Stripped provider prefix from '{current_model}'; "
+                    f"using '{slug}' for OpenAI Codex.[/]"
+                )
+            self.model = slug
+            current_model = slug
+            changed = True
+
+        # 2. Replace untouched default with a Codex model
+        if self._model_is_default:
+            fallback_model = "gpt-5.3-codex"
+            try:
+                from hermes_cli.codex_models import get_codex_model_ids
+
+                available = get_codex_model_ids(
+                    access_token=self.api_key if self.api_key else None,
+                )
+                if available:
+                    fallback_model = available[0]
+            except Exception:
+                pass
+
+            if current_model != fallback_model:
+                self.model = fallback_model
+                changed = True
+
+        return changed
+
+    def _on_thinking(self, text: str) -> None:
+        """Called by agent when thinking starts/stops. Updates TUI spinner."""
+        self._spinner_text = text or ""
+        self._invalidate()
+
+    def _slow_command_status(self, command: str) -> str:
+        """Return a user-facing status message for slower slash commands."""
+        cmd_lower = command.lower().strip()
+        if cmd_lower.startswith("/skills search"):
+            return "Searching skills..."
+        if cmd_lower.startswith("/skills browse"):
+            return "Loading skills..."
+        if cmd_lower.startswith("/skills inspect"):
+            return "Inspecting skill..."
+        if cmd_lower.startswith("/skills install"):
+            return "Installing skill..."
+        if cmd_lower.startswith("/skills"):
+            return "Processing skills command..."
+        if cmd_lower == "/reload-mcp":
+            return "Reloading MCP servers..."
+        return "Processing command..."
+
+    def _command_spinner_frame(self) -> str:
+        """Return the current spinner frame for slow slash commands."""
+        import time as _time
+
+        frame_idx = int(_time.monotonic() * 10) % len(_COMMAND_SPINNER_FRAMES)
+        return _COMMAND_SPINNER_FRAMES[frame_idx]
+
+    @contextmanager
+    def _busy_command(self, status: str):
+        """Expose a temporary busy state in the TUI while a slash command runs."""
+        self._command_running = True
+        self._command_status = status
+        self._invalidate(min_interval=0.0)
+        try:
+            print(f"⏳ {status}")
+            yield
+        finally:
+            self._command_running = False
+            self._command_status = ""
+            self._invalidate(min_interval=0.0)
 
     def _ensure_runtime_credentials(self) -> bool:
         """
-        Ensure OAuth provider credentials are fresh before agent use.
-        For Nous Portal: checks agent key TTL, refreshes/re-mints as needed.
-        If the key changed, tears down the agent so it rebuilds with new creds.
+        Ensure runtime credentials are resolved before agent use.
+        Re-resolves provider credentials so key rotation and token refresh
+        are picked up without restarting the CLI.
         Returns True if credentials are ready, False on auth failure.
         """
-        if self.provider != "nous":
-            return True
-
-        from hermes_cli.auth import format_auth_error, resolve_nous_runtime_credentials
+        from hermes_cli.runtime_provider import (
+            resolve_runtime_provider,
+            format_runtime_provider_error,
+        )
 
         try:
-            credentials = resolve_nous_runtime_credentials(
-                min_key_ttl_seconds=max(
-                    60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))
-                ),
-                timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
+            runtime = resolve_runtime_provider(
+                requested=self.requested_provider,
+                explicit_api_key=self._explicit_api_key,
+                explicit_base_url=self._explicit_base_url,
             )
         except Exception as exc:
-            message = format_auth_error(exc)
+            message = format_runtime_provider_error(exc)
             self.console.print(f"[bold red]{message}[/]")
             return False
 
-        api_key = credentials.get("api_key")
-        base_url = credentials.get("base_url")
+        api_key = runtime.get("api_key")
+        base_url = runtime.get("base_url")
+        resolved_provider = runtime.get("provider", "openrouter")
+        resolved_api_mode = runtime.get("api_mode", self.api_mode)
         if not isinstance(api_key, str) or not api_key:
-            self.console.print("[bold red]Nous credential resolver returned an empty API key.[/]")
+            self.console.print("[bold red]Provider resolver returned an empty API key.[/]")
             return False
         if not isinstance(base_url, str) or not base_url:
-            self.console.print("[bold red]Nous credential resolver returned an empty base URL.[/]")
+            self.console.print("[bold red]Provider resolver returned an empty base URL.[/]")
             return False
 
         credentials_changed = api_key != self.api_key or base_url != self.base_url
+        routing_changed = (
+            resolved_provider != self.provider
+            or resolved_api_mode != self.api_mode
+        )
+        self.provider = resolved_provider
+        self.api_mode = resolved_api_mode
+        self._provider_source = runtime.get("source")
         self.api_key = api_key
         self.base_url = base_url
-        self._nous_key_expires_at = credentials.get("expires_at")
-        self._nous_key_source = credentials.get("source")
 
-        # AIAgent/OpenAI client holds auth at init time, so rebuild if key rotated
-        if credentials_changed and self.agent is not None:
+        # Normalize model for the resolved provider (e.g. swap non-Codex
+        # models when provider is openai-codex).  Fixes #651.
+        model_changed = self._normalize_model_for_provider(resolved_provider)
+
+        # AIAgent/OpenAI client holds auth at init time, so rebuild if key,
+        # routing, or the effective model changed.
+        if (credentials_changed or routing_changed or model_changed) and self.agent is not None:
             self.agent = None
 
         return True
@@ -936,19 +1439,22 @@ class HermesCLI:
         if self.agent is not None:
             return True
 
-        if self.provider == "nous" and not self._ensure_runtime_credentials():
+        if not self._ensure_runtime_credentials():
             return False
 
-        # Initialize SQLite session store for CLI sessions
-        self._session_db = None
-        try:
-            from hermes_state import SessionDB
-            self._session_db = SessionDB()
-        except Exception as e:
-            logger.debug("SQLite session store not available: %s", e)
+        # Initialize SQLite session store for CLI sessions (if not already done in __init__)
+        if self._session_db is None:
+            try:
+                from hermes_state import SessionDB
+                self._session_db = SessionDB()
+            except Exception as e:
+                logger.debug("SQLite session store not available: %s", e)
         
-        # If resuming, validate the session exists and load its history
-        if self._resumed and self._session_db:
+        # If resuming, validate the session exists and load its history.
+        # _preload_resumed_session() may have already loaded it (called from
+        # run() for immediate display).  In that case, conversation_history
+        # is non-empty and we skip the DB round-trip.
+        if self._resumed and self._session_db and not self.conversation_history:
             session_meta = self._session_db.get_session(self.session_id)
             if not session_meta:
                 _cprint(f"\033[1;31mSession not found: {self.session_id}{_RST}")
@@ -958,8 +1464,11 @@ class HermesCLI:
             if restored:
                 self.conversation_history = restored
                 msg_count = len([m for m in restored if m.get("role") == "user"])
+                title_part = ""
+                if session_meta.get("title"):
+                    title_part = f" \"{session_meta['title']}\""
                 _cprint(
-                    f"{_GOLD}↻ Resumed session {_BOLD}{self.session_id}{_RST}{_GOLD} "
+                    f"{_GOLD}↻ Resumed session {_BOLD}{self.session_id}{_RST}{_GOLD}{title_part} "
                     f"({msg_count} user message{'s' if msg_count != 1 else ''}, "
                     f"{len(restored)} total messages){_RST}"
                 )
@@ -980,6 +1489,8 @@ class HermesCLI:
                 model=self.model,
                 api_key=self.api_key,
                 base_url=self.base_url,
+                provider=self.provider,
+                api_mode=self.api_mode,
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
                 verbose_logging=self.verbose,
@@ -987,12 +1498,33 @@ class HermesCLI:
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config,
+                providers_allowed=self._providers_only,
+                providers_ignored=self._providers_ignore,
+                providers_order=self._providers_order,
+                provider_sort=self._provider_sort,
+                provider_require_parameters=self._provider_require_params,
+                provider_data_collection=self._provider_data_collection,
                 session_id=self.session_id,
                 platform="cli",
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
+                reasoning_callback=self._on_reasoning if self.show_reasoning else None,
                 honcho_session_key=self.session_id,
+                fallback_model=self._fallback_model,
+                thinking_callback=self._on_thinking,
+                checkpoints_enabled=self.checkpoints_enabled,
+                checkpoint_max_snapshots=self.checkpoint_max_snapshots,
+                pass_session_id=self.pass_session_id,
             )
+            # Apply any pending title now that the session exists in the DB
+            if self._pending_title and self._session_db:
+                try:
+                    self._session_db.set_session_title(self.session_id, self._pending_title)
+                    _cprint(f"  Session title applied: {self._pending_title}")
+                    self._pending_title = None
+                except (ValueError, Exception) as e:
+                    _cprint(f"  Could not apply pending title: {e}")
+                    self._pending_title = None
             return True
         except Exception as e:
             self.console.print(f"[bold red]Failed to initialize agent: {e}[/]")
@@ -1002,8 +1534,13 @@ class HermesCLI:
         """Display the welcome banner in Claude Code style."""
         self.console.clear()
         
-        if self.compact:
-            self.console.print(COMPACT_BANNER)
+        # Auto-compact for narrow terminals — the full banner with caduceus
+        # + tool list needs ~80 columns minimum to render without wrapping.
+        term_width = shutil.get_terminal_size().columns
+        use_compact = self.compact or term_width < 80
+        
+        if use_compact:
+            self.console.print(_build_compact_banner())
             self._show_status()
         else:
             # Get tools for display
@@ -1011,6 +1548,11 @@ class HermesCLI:
             
             # Get terminal working directory (where commands will execute)
             cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+            
+            # Get context length for display
+            ctx_len = None
+            if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+                ctx_len = self.agent.context_compressor.context_length
             
             # Build and display the banner
             build_welcome_banner(
@@ -1020,13 +1562,357 @@ class HermesCLI:
                 tools=tools,
                 enabled_toolsets=self.enabled_toolsets,
                 session_id=self.session_id,
+                context_length=ctx_len,
             )
         
         # Show tool availability warnings if any tools are disabled
         self._show_tool_availability_warnings()
         
         self.console.print()
-    
+
+    def _preload_resumed_session(self) -> bool:
+        """Load a resumed session's history from the DB early (before first chat).
+
+        Called from run() so the conversation history is available for display
+        before the user sends their first message.  Sets
+        ``self.conversation_history`` and prints the one-liner status.  Returns
+        True if history was loaded, False otherwise.
+
+        The corresponding block in ``_init_agent()`` checks whether history is
+        already populated and skips the DB round-trip.
+        """
+        if not self._resumed or not self._session_db:
+            return False
+
+        session_meta = self._session_db.get_session(self.session_id)
+        if not session_meta:
+            self.console.print(
+                f"[bold red]Session not found: {self.session_id}[/]"
+            )
+            self.console.print(
+                "[dim]Use a session ID from a previous CLI run "
+                "(hermes sessions list).[/]"
+            )
+            return False
+
+        restored = self._session_db.get_messages_as_conversation(self.session_id)
+        if restored:
+            self.conversation_history = restored
+            msg_count = len([m for m in restored if m.get("role") == "user"])
+            title_part = ""
+            if session_meta.get("title"):
+                title_part = f' "{session_meta["title"]}"'
+            self.console.print(
+                f"[#DAA520]↻ Resumed session [bold]{self.session_id}[/bold]"
+                f"{title_part} "
+                f"({msg_count} user message{'s' if msg_count != 1 else ''}, "
+                f"{len(restored)} total messages)[/]"
+            )
+        else:
+            self.console.print(
+                f"[#DAA520]Session {self.session_id} found but has no "
+                f"messages. Starting fresh.[/]"
+            )
+            return False
+
+        # Re-open the session (clear ended_at so it's active again)
+        try:
+            self._session_db._conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                "WHERE id = ?",
+                (self.session_id,),
+            )
+            self._session_db._conn.commit()
+        except Exception:
+            pass
+
+        return True
+
+    def _display_resumed_history(self):
+        """Render a compact recap of previous conversation messages.
+
+        Uses Rich markup with dim/muted styling so the recap is visually
+        distinct from the active conversation.  Caps the display at the
+        last ``MAX_DISPLAY_EXCHANGES`` user/assistant exchanges and shows
+        an indicator for earlier hidden messages.
+        """
+        if not self.conversation_history:
+            return
+
+        # Check config: resume_display setting
+        if self.resume_display == "minimal":
+            return
+
+        MAX_DISPLAY_EXCHANGES = 10   # max user+assistant pairs to show
+        MAX_USER_LEN = 300           # truncate user messages
+        MAX_ASST_LEN = 200           # truncate assistant text
+        MAX_ASST_LINES = 3           # max lines of assistant text
+
+        def _strip_reasoning(text: str) -> str:
+            """Remove <REASONING_SCRATCHPAD>...</REASONING_SCRATCHPAD> blocks
+            from displayed text (reasoning model internal thoughts)."""
+            import re
+            cleaned = re.sub(
+                r"<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>\s*",
+                "", text, flags=re.DOTALL,
+            )
+            # Also strip unclosed reasoning tags at the end
+            cleaned = re.sub(
+                r"<REASONING_SCRATCHPAD>.*$",
+                "", cleaned, flags=re.DOTALL,
+            )
+            return cleaned.strip()
+
+        # Collect displayable entries (skip system, tool-result messages)
+        entries = []  # list of (role, display_text)
+        for msg in self.conversation_history:
+            role = msg.get("role", "")
+            content = msg.get("content")
+            tool_calls = msg.get("tool_calls") or []
+
+            if role == "system":
+                continue
+            if role == "tool":
+                continue
+
+            if role == "user":
+                text = "" if content is None else str(content)
+                # Handle multimodal content (list of dicts)
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            parts.append(part.get("text", ""))
+                        elif isinstance(part, dict) and part.get("type") == "image_url":
+                            parts.append("[image]")
+                    text = " ".join(parts)
+                if len(text) > MAX_USER_LEN:
+                    text = text[:MAX_USER_LEN] + "..."
+                entries.append(("user", text))
+
+            elif role == "assistant":
+                text = "" if content is None else str(content)
+                text = _strip_reasoning(text)
+                parts = []
+                if text:
+                    lines = text.splitlines()
+                    if len(lines) > MAX_ASST_LINES:
+                        text = "\n".join(lines[:MAX_ASST_LINES]) + " ..."
+                    if len(text) > MAX_ASST_LEN:
+                        text = text[:MAX_ASST_LEN] + "..."
+                    parts.append(text)
+                if tool_calls:
+                    tc_count = len(tool_calls)
+                    # Extract tool names
+                    names = []
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "unknown") if isinstance(fn, dict) else "unknown"
+                        if name not in names:
+                            names.append(name)
+                    names_str = ", ".join(names[:4])
+                    if len(names) > 4:
+                        names_str += ", ..."
+                    noun = "call" if tc_count == 1 else "calls"
+                    parts.append(f"[{tc_count} tool {noun}: {names_str}]")
+                if not parts:
+                    # Skip pure-reasoning messages that have no visible output
+                    continue
+                entries.append(("assistant", " ".join(parts)))
+
+        if not entries:
+            return
+
+        # Determine if we need to truncate
+        skipped = 0
+        if len(entries) > MAX_DISPLAY_EXCHANGES * 2:
+            skipped = len(entries) - MAX_DISPLAY_EXCHANGES * 2
+            entries = entries[skipped:]
+
+        # Build the display using Rich
+        from rich.panel import Panel
+        from rich.text import Text
+
+        lines = Text()
+        if skipped:
+            lines.append(
+                f"  ... {skipped} earlier messages ...\n\n",
+                style="dim italic",
+            )
+
+        for i, (role, text) in enumerate(entries):
+            if role == "user":
+                lines.append("  ● You: ", style="dim bold #DAA520")
+                # Show first line inline, indent rest
+                msg_lines = text.splitlines()
+                lines.append(msg_lines[0] + "\n", style="dim")
+                for ml in msg_lines[1:]:
+                    lines.append(f"         {ml}\n", style="dim")
+            else:
+                lines.append("  ◆ Hermes: ", style="dim bold #8FBC8F")
+                msg_lines = text.splitlines()
+                lines.append(msg_lines[0] + "\n", style="dim")
+                for ml in msg_lines[1:]:
+                    lines.append(f"            {ml}\n", style="dim")
+            if i < len(entries) - 1:
+                lines.append("")  # small gap
+
+        panel = Panel(
+            lines,
+            title="[dim #DAA520]Previous Conversation[/]",
+            border_style="dim #8B8682",
+            padding=(0, 1),
+        )
+        self.console.print(panel)
+
+    def _try_attach_clipboard_image(self) -> bool:
+        """Check clipboard for an image and attach it if found.
+
+        Saves the image to ~/.hermes/images/ and appends the path to
+        ``_attached_images``.  Returns True if an image was attached.
+        """
+        from hermes_cli.clipboard import save_clipboard_image
+
+        img_dir = Path.home() / ".hermes" / "images"
+        self._image_counter += 1
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        img_path = img_dir / f"clip_{ts}_{self._image_counter}.png"
+
+        if save_clipboard_image(img_path):
+            self._attached_images.append(img_path)
+            return True
+        self._image_counter -= 1
+        return False
+
+    def _handle_rollback_command(self, command: str):
+        """Handle /rollback — list or restore filesystem checkpoints."""
+        from tools.checkpoint_manager import CheckpointManager, format_checkpoint_list
+
+        if not hasattr(self, 'agent') or not self.agent:
+            print("  No active agent session.")
+            return
+
+        mgr = self.agent._checkpoint_mgr
+        if not mgr.enabled:
+            print("  Checkpoints are not enabled.")
+            print("  Enable with: hermes --checkpoints")
+            print("  Or in config.yaml: checkpoints: { enabled: true }")
+            return
+
+        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+        parts = command.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if not arg:
+            # List checkpoints
+            checkpoints = mgr.list_checkpoints(cwd)
+            print(format_checkpoint_list(checkpoints, cwd))
+        else:
+            # Restore by number or hash
+            checkpoints = mgr.list_checkpoints(cwd)
+            if not checkpoints:
+                print(f"  No checkpoints found for {cwd}")
+                return
+
+            target_hash = None
+            try:
+                idx = int(arg) - 1  # 1-indexed for user
+                if 0 <= idx < len(checkpoints):
+                    target_hash = checkpoints[idx]["hash"]
+                else:
+                    print(f"  Invalid checkpoint number. Use 1-{len(checkpoints)}.")
+                    return
+            except ValueError:
+                # Try as a git hash
+                target_hash = arg
+
+            result = mgr.restore(cwd, target_hash)
+            if result["success"]:
+                print(f"  ✅ Restored to checkpoint {result['restored_to']}: {result['reason']}")
+                print(f"  A pre-rollback snapshot was saved automatically.")
+            else:
+                print(f"  ❌ {result['error']}")
+
+    def _handle_paste_command(self):
+        """Handle /paste — explicitly check clipboard for an image.
+
+        This is the reliable fallback for terminals where BracketedPaste
+        doesn't fire for image-only clipboard content (e.g., VSCode terminal,
+        Windows Terminal with WSL2).
+        """
+        from hermes_cli.clipboard import has_clipboard_image
+        if has_clipboard_image():
+            if self._try_attach_clipboard_image():
+                n = len(self._attached_images)
+                _cprint(f"  📎 Image #{n} attached from clipboard")
+            else:
+                _cprint(f"  {_DIM}(>_<) Clipboard has an image but extraction failed{_RST}")
+        else:
+            _cprint(f"  {_DIM}(._.) No image found in clipboard{_RST}")
+
+    def _preprocess_images_with_vision(self, text: str, images: list) -> str:
+        """Analyze attached images via the vision tool and return enriched text.
+
+        Instead of embedding raw base64 ``image_url`` content parts in the
+        conversation (which only works with vision-capable models), this
+        pre-processes each image through the auxiliary vision model (Gemini
+        Flash) and prepends the descriptions to the user's message — the
+        same approach the messaging gateway uses.
+
+        The local file path is included so the agent can re-examine the
+        image later with ``vision_analyze`` if needed.
+        """
+        import asyncio as _asyncio
+        import json as _json
+        from tools.vision_tools import vision_analyze_tool
+
+        analysis_prompt = (
+            "Describe everything visible in this image in thorough detail. "
+            "Include any text, code, data, objects, people, layout, colors, "
+            "and any other notable visual information."
+        )
+
+        enriched_parts = []
+        for img_path in images:
+            if not img_path.exists():
+                continue
+            size_kb = img_path.stat().st_size // 1024
+            _cprint(f"  {_DIM}👁️  analyzing {img_path.name} ({size_kb}KB)...{_RST}")
+            try:
+                result_json = _asyncio.run(
+                    vision_analyze_tool(image_url=str(img_path), user_prompt=analysis_prompt)
+                )
+                result = _json.loads(result_json)
+                if result.get("success"):
+                    description = result.get("analysis", "")
+                    enriched_parts.append(
+                        f"[The user attached an image. Here's what it contains:\n{description}]\n"
+                        f"[If you need a closer look, use vision_analyze with "
+                        f"image_url: {img_path}]"
+                    )
+                    _cprint(f"  {_DIM}✓ image analyzed{_RST}")
+                else:
+                    enriched_parts.append(
+                        f"[The user attached an image but it couldn't be analyzed. "
+                        f"You can try examining it with vision_analyze using "
+                        f"image_url: {img_path}]"
+                    )
+                    _cprint(f"  {_DIM}⚠ vision analysis failed — path included for retry{_RST}")
+            except Exception as e:
+                enriched_parts.append(
+                    f"[The user attached an image but analysis failed ({e}). "
+                    f"You can try examining it with vision_analyze using "
+                    f"image_url: {img_path}]"
+                )
+                _cprint(f"  {_DIM}⚠ vision analysis error — path included for retry{_RST}")
+
+        # Combine: vision descriptions first, then the user's original text
+        user_text = text if isinstance(text, str) and text else ""
+        if enriched_parts:
+            prefix = "\n\n".join(enriched_parts)
+            return f"{prefix}\n\n{user_text}" if user_text else prefix
+        return user_text or "What do you see in this image?"
+
     def _show_tool_availability_warnings(self):
         """Show warnings about disabled tools due to missing API keys."""
         try:
@@ -1072,8 +1958,8 @@ class HermesCLI:
             toolsets_info = f" [dim #B8860B]·[/] [#CD7F32]toolsets: {', '.join(self.enabled_toolsets)}[/]"
 
         provider_info = f" [dim #B8860B]·[/] [dim]provider: {self.provider}[/]"
-        if self.provider == "nous" and self._nous_key_source:
-            provider_info += f" [dim #B8860B]·[/] [dim]key: {self._nous_key_source}[/]"
+        if self._provider_source:
+            provider_info += f" [dim #B8860B]·[/] [dim]auth: {self._provider_source}[/]"
 
         self.console.print(
             f"  {api_indicator} [#FFBF00]{model_short}[/] "
@@ -1082,20 +1968,26 @@ class HermesCLI:
         )
     
     def show_help(self):
-        """Display help information with kawaii ASCII art."""
-        print()
-        print("+" + "-" * 50 + "+")
-        print("|" + " " * 14 + "(^_^)? Available Commands" + " " * 10 + "|")
-        print("+" + "-" * 50 + "+")
-        print()
-        
-        for cmd, desc in COMMANDS.items():
-            print(f"  {cmd:<15} - {desc}")
-        
-        print()
-        print("  Tip: Just type your message to chat with Hermes!")
-        print("  Multi-line: Alt+Enter for a new line")
-        print()
+        """Display help information with categorized commands."""
+        from hermes_cli.commands import COMMANDS_BY_CATEGORY
+
+        _cprint(f"\n{_BOLD}+{'-' * 55}+{_RST}")
+        _cprint(f"{_BOLD}|{' ' * 14}(^_^)? Available Commands{' ' * 15}|{_RST}")
+        _cprint(f"{_BOLD}+{'-' * 55}+{_RST}")
+
+        for category, commands in COMMANDS_BY_CATEGORY.items():
+            _cprint(f"\n  {_BOLD}── {category} ──{_RST}")
+            for cmd, desc in commands.items():
+                _cprint(f"    {_GOLD}{cmd:<15}{_RST} {_DIM}-{_RST} {desc}")
+
+        if _skill_commands:
+            _cprint(f"\n  ⚡ {_BOLD}Skill Commands{_RST} ({len(_skill_commands)} installed):")
+            for cmd, info in sorted(_skill_commands.items()):
+                _cprint(f"    {_GOLD}{cmd:<22}{_RST} {_DIM}-{_RST} {info['description']}")
+
+        _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
+        _cprint(f"  {_DIM}Multi-line: Alt+Enter for a new line{_RST}")
+        _cprint(f"  {_DIM}Paste image: Alt+V (or /paste){_RST}\n")
     
     def show_tools(self):
         """Display available tools with kawaii ASCII art."""
@@ -1107,9 +1999,12 @@ class HermesCLI:
         
         # Header
         print()
-        print("+" + "-" * 78 + "+")
-        print("|" + " " * 25 + "(^_^)/ Available Tools" + " " * 30 + "|")
-        print("+" + "-" * 78 + "+")
+        title = "(^_^)/ Available Tools"
+        width = 78
+        pad = width - len(title)
+        print("+" + "-" * width + "+")
+        print("|" + " " * (pad // 2) + title + " " * (pad - pad // 2) + "|")
+        print("+" + "-" * width + "+")
         print()
         
         # Group tools by toolset
@@ -1142,16 +2037,19 @@ class HermesCLI:
         
         # Header
         print()
-        print("+" + "-" * 58 + "+")
-        print("|" + " " * 15 + "(^_^)b Available Toolsets" + " " * 17 + "|")
-        print("+" + "-" * 58 + "+")
+        title = "(^_^)b Available Toolsets"
+        width = 58
+        pad = width - len(title)
+        print("+" + "-" * width + "+")
+        print("|" + " " * (pad // 2) + title + " " * (pad - pad // 2) + "|")
+        print("+" + "-" * width + "+")
         print()
         
         for name in sorted(all_toolsets.keys()):
             info = get_toolset_info(name)
             if info:
                 tool_count = info["tool_count"]
-                desc = info["description"][:45]
+                desc = info["description"]
                 
                 # Mark if currently enabled
                 marker = "(*)" if self.enabled_toolsets and name in self.enabled_toolsets else "   "
@@ -1182,9 +2080,12 @@ class HermesCLI:
         api_key_display = '********' + self.api_key[-4:] if self.api_key and len(self.api_key) > 4 else 'Not set!'
         
         print()
-        print("+" + "-" * 50 + "+")
-        print("|" + " " * 15 + "(^_^) Configuration" + " " * 15 + "|")
-        print("+" + "-" * 50 + "+")
+        title = "(^_^) Configuration"
+        width = 50
+        pad = width - len(title)
+        print("+" + "-" * width + "+")
+        print("|" + " " * (pad // 2) + title + " " * (pad - pad // 2) + "|")
+        print("+" + "-" * width + "+")
         print()
         print("  -- Model --")
         print(f"  Model:     {self.model}")
@@ -1216,24 +2117,65 @@ class HermesCLI:
         if not self.conversation_history:
             print("(._.) No conversation history yet.")
             return
-        
+
+        preview_limit = 400
+        visible_index = 0
+        hidden_tool_messages = 0
+
+        def flush_tool_summary():
+            nonlocal hidden_tool_messages
+            if not hidden_tool_messages:
+                return
+
+            noun = "message" if hidden_tool_messages == 1 else "messages"
+            print("\n  [Tools]")
+            print(f"    ({hidden_tool_messages} tool {noun} hidden)")
+            hidden_tool_messages = 0
+
         print()
         print("+" + "-" * 50 + "+")
         print("|" + " " * 12 + "(^_^) Conversation History" + " " * 11 + "|")
         print("+" + "-" * 50 + "+")
-        
-        for i, msg in enumerate(self.conversation_history, 1):
+
+        for msg in self.conversation_history:
             role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            
+
+            if role == "tool":
+                hidden_tool_messages += 1
+                continue
+
+            if role not in {"user", "assistant"}:
+                continue
+
+            flush_tool_summary()
+            visible_index += 1
+
+            content = msg.get("content")
+            content_text = "" if content is None else str(content)
+
             if role == "user":
-                print(f"\n  [You #{i}]")
-                print(f"    {content[:200]}{'...' if len(content) > 200 else ''}")
-            elif role == "assistant":
-                print(f"\n  [Hermes #{i}]")
-                preview = content[:200] if content else "(tool calls)"
-                print(f"    {preview}{'...' if len(str(content)) > 200 else ''}")
-        
+                print(f"\n  [You #{visible_index}]")
+                print(
+                    f"    {content_text[:preview_limit]}{'...' if len(content_text) > preview_limit else ''}"
+                )
+                continue
+
+            print(f"\n  [Hermes #{visible_index}]")
+            tool_calls = msg.get("tool_calls") or []
+            if content_text:
+                preview = content_text[:preview_limit]
+                suffix = "..." if len(content_text) > preview_limit else ""
+            elif tool_calls:
+                tool_count = len(tool_calls)
+                noun = "call" if tool_count == 1 else "calls"
+                preview = f"(requested {tool_count} tool {noun})"
+                suffix = ""
+            else:
+                preview = "(no text response)"
+                suffix = ""
+            print(f"    {preview}{suffix}")
+
+        flush_tool_summary()
         print()
     
     def reset_conversation(self):
@@ -1327,6 +2269,72 @@ class HermesCLI:
         remaining = len(self.conversation_history)
         print(f"  {remaining} message(s) remaining in history.")
     
+    def _show_model_and_providers(self):
+        """Unified /model and /provider display.
+
+        Shows current model + provider, then lists all authenticated
+        providers with their available models so users can switch easily.
+        """
+        from hermes_cli.models import (
+            curated_models_for_provider, list_available_providers,
+            normalize_provider, _PROVIDER_LABELS,
+        )
+        from hermes_cli.auth import resolve_provider as _resolve_provider
+
+        # Resolve current provider
+        raw_provider = normalize_provider(self.provider)
+        if raw_provider == "auto":
+            try:
+                current = _resolve_provider(
+                    self.requested_provider,
+                    explicit_api_key=self._explicit_api_key,
+                    explicit_base_url=self._explicit_base_url,
+                )
+            except Exception:
+                current = "openrouter"
+        else:
+            current = raw_provider
+        current_label = _PROVIDER_LABELS.get(current, current)
+
+        print(f"\n  Current: {self.model} via {current_label}")
+        print()
+
+        # Show all authenticated providers with their models
+        providers = list_available_providers()
+        authed = [p for p in providers if p["authenticated"]]
+        unauthed = [p for p in providers if not p["authenticated"]]
+
+        if authed:
+            print("  Authenticated providers & models:")
+            for p in authed:
+                is_active = p["id"] == current
+                marker = " ← active" if is_active else ""
+                print(f"    [{p['id']}]{marker}")
+                curated = curated_models_for_provider(p["id"])
+                if curated:
+                    for mid, desc in curated:
+                        current_marker = " ← current" if (is_active and mid == self.model) else ""
+                        print(f"      {mid}{current_marker}")
+                else:
+                    print(f"      (use /model {p['id']}:<model-name>)")
+                print()
+
+        if unauthed:
+            names = ", ".join(p["label"] for p in unauthed)
+            print(f"  Not configured: {names}")
+            print(f"  Run: hermes setup")
+            print()
+
+        print("  Switch model:    /model <model-name>")
+        print("  Switch provider: /model <provider>:<model-name>")
+        if authed and len(authed) > 1:
+            # Show a concrete example with a non-active provider
+            other = next((p for p in authed if p["id"] != current), authed[0])
+            other_models = curated_models_for_provider(other["id"])
+            if other_models:
+                example_model = other_models[0][0]
+                print(f"  Example: /model {other['id']}:{example_model}")
+
     def _handle_prompt_command(self, cmd: str):
         """Handle the /prompt command to view or set system prompt."""
         parts = cmd.split(maxsplit=1)
@@ -1381,6 +2389,19 @@ class HermesCLI:
             print("    /personality    - Use a predefined personality")
             print()
     
+
+    @staticmethod
+    def _resolve_personality_prompt(value) -> str:
+        """Accept string or dict personality value; return system prompt string."""
+        if isinstance(value, dict):
+            parts = [value.get("system_prompt", "")]
+            if value.get("tone"):
+                parts.append(f'Tone: {value["tone"]}' )
+            if value.get("style"):
+                parts.append(f'Style: {value["style"]}' )
+            return "\n".join(p for p in parts if p)
+        return str(value)
+
     def _handle_personality_command(self, cmd: str):
         """Handle the /personality command to set predefined personalities."""
         parts = cmd.split(maxsplit=1)
@@ -1389,8 +2410,16 @@ class HermesCLI:
             # Set personality
             personality_name = parts[1].strip().lower()
             
-            if personality_name in self.personalities:
-                self.system_prompt = self.personalities[personality_name]
+            if personality_name in ("none", "default", "neutral"):
+                self.system_prompt = ""
+                self.agent = None  # Force re-init
+                if save_config_value("agent.system_prompt", ""):
+                    print("(^_^)b Personality cleared (saved to config)")
+                else:
+                    print("(^_^) Personality cleared (session only)")
+                print("  No personality overlay — using base agent behavior.")
+            elif personality_name in self.personalities:
+                self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
                 self.agent = None  # Force re-init
                 if save_config_value("agent.system_prompt", self.system_prompt):
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
@@ -1399,7 +2428,7 @@ class HermesCLI:
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
-                print(f"  Available: {', '.join(self.personalities.keys())}")
+                print(f"  Available: none, {', '.join(self.personalities.keys())}")
         else:
             # Show available personalities
             print()
@@ -1407,9 +2436,13 @@ class HermesCLI:
             print("|" + " " * 12 + "(^o^)/ Personalities" + " " * 15 + "|")
             print("+" + "-" * 50 + "+")
             print()
+            print(f"  {'none':<12} - (no personality overlay)")
             for name, prompt in self.personalities.items():
-                truncated = prompt[:40] + "..." if len(prompt) > 40 else prompt
-                print(f"  {name:<12} - \"{truncated}\"")
+                if isinstance(prompt, dict):
+                    preview = prompt.get("description") or prompt.get("system_prompt", "")[:50]
+                else:
+                    preview = str(prompt)[:50]
+                print(f"  {name:<12} - {preview}")
             print()
             print("  Usage: /personality <name>")
             print()
@@ -1643,32 +2676,183 @@ class HermesCLI:
                     self.agent.flush_memories(self.conversation_history)
                 except Exception:
                     pass
-            # Clear terminal screen using Rich (portable, no shell needed)
-            self.console.clear()
+            # Clear terminal screen.  Inside the TUI, Rich's console.clear()
+            # goes through patch_stdout's StdoutProxy which swallows the
+            # screen-clear escape sequences.  Use prompt_toolkit's output
+            # object directly to actually clear the terminal.
+            if self._app:
+                out = self._app.output
+                out.erase_screen()
+                out.cursor_goto(0, 0)
+                out.flush()
+            else:
+                self.console.clear()
             # Reset conversation
             self.conversation_history = []
-            # Show fresh banner
-            self.show_banner()
-            print("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
+            # Show fresh banner.  Inside the TUI we must route Rich output
+            # through ChatConsole (which uses prompt_toolkit's native ANSI
+            # renderer) instead of self.console (which writes raw to stdout
+            # and gets mangled by patch_stdout).
+            if self._app:
+                cc = ChatConsole()
+                term_w = shutil.get_terminal_size().columns
+                if self.compact or term_w < 80:
+                    cc.print(_build_compact_banner())
+                else:
+                    tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                    cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+                    ctx_len = None
+                    if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):
+                        ctx_len = self.agent.context_compressor.context_length
+                    build_welcome_banner(
+                        console=cc,
+                        model=self.model,
+                        cwd=cwd,
+                        tools=tools,
+                        enabled_toolsets=self.enabled_toolsets,
+                        session_id=self.session_id,
+                        context_length=ctx_len,
+                    )
+                _cprint("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
+            else:
+                self.show_banner()
+                print("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
         elif cmd_lower == "/history":
             self.show_history()
+        elif cmd_lower.startswith("/title"):
+            parts = cmd_original.split(maxsplit=1)
+            if len(parts) > 1:
+                raw_title = parts[1].strip()
+                if raw_title:
+                    if self._session_db:
+                        # Sanitize the title early so feedback matches what gets stored
+                        try:
+                            from hermes_state import SessionDB
+                            new_title = SessionDB.sanitize_title(raw_title)
+                        except ValueError as e:
+                            _cprint(f"  {e}")
+                            new_title = None
+                        if not new_title:
+                            _cprint("  Title is empty after cleanup. Please use printable characters.")
+                        elif self._session_db.get_session(self.session_id):
+                            # Session exists in DB — set title directly
+                            try:
+                                if self._session_db.set_session_title(self.session_id, new_title):
+                                    _cprint(f"  Session title set: {new_title}")
+                                else:
+                                    _cprint("  Session not found in database.")
+                            except ValueError as e:
+                                _cprint(f"  {e}")
+                        else:
+                            # Session not created yet — defer the title
+                            # Check uniqueness proactively with the sanitized title
+                            existing = self._session_db.get_session_by_title(new_title)
+                            if existing:
+                                _cprint(f"  Title '{new_title}' is already in use by session {existing['id']}")
+                            else:
+                                self._pending_title = new_title
+                                _cprint(f"  Session title queued: {new_title} (will be saved on first message)")
+                    else:
+                        _cprint("  Session database not available.")
+                else:
+                    _cprint("  Usage: /title <your session title>")
+            else:
+                # Show current title if no argument given
+                if self._session_db:
+                    session = self._session_db.get_session(self.session_id)
+                    if session and session.get("title"):
+                        _cprint(f"  Session title: {session['title']}")
+                    elif self._pending_title:
+                        _cprint(f"  Session title (pending): {self._pending_title}")
+                    else:
+                        _cprint(f"  No title set. Usage: /title <your session title>")
+                else:
+                    _cprint("  Session database not available.")
         elif cmd_lower in ("/reset", "/new"):
             self.reset_conversation()
         elif cmd_lower.startswith("/model"):
             # Use original case so model names like "Anthropic/Claude-Opus-4" are preserved
             parts = cmd_original.split(maxsplit=1)
             if len(parts) > 1:
-                new_model = parts[1]
-                self.model = new_model
-                self.agent = None  # Force re-init
-                # Save to config
-                if save_config_value("model.default", new_model):
-                    print(f"(^_^)b Model changed to: {new_model} (saved to config)")
+                from hermes_cli.auth import resolve_provider
+                from hermes_cli.models import (
+                    parse_model_input,
+                    validate_requested_model,
+                    _PROVIDER_LABELS,
+                )
+
+                raw_input = parts[1].strip()
+
+                # Parse provider:model syntax (e.g. "openrouter:anthropic/claude-sonnet-4.5")
+                current_provider = self.provider or self.requested_provider or "openrouter"
+                target_provider, new_model = parse_model_input(raw_input, current_provider)
+                provider_changed = target_provider != current_provider
+
+                # If provider is changing, re-resolve credentials for the new provider
+                api_key_for_probe = self.api_key
+                base_url_for_probe = self.base_url
+                if provider_changed:
+                    try:
+                        from hermes_cli.runtime_provider import resolve_runtime_provider
+                        runtime = resolve_runtime_provider(requested=target_provider)
+                        api_key_for_probe = runtime.get("api_key", "")
+                        base_url_for_probe = runtime.get("base_url", "")
+                    except Exception as e:
+                        provider_label = _PROVIDER_LABELS.get(target_provider, target_provider)
+                        if target_provider == "custom":
+                            print(f"(>_<) Custom endpoint not configured. Set OPENAI_BASE_URL and OPENAI_API_KEY,")
+                            print(f"      or run: hermes setup → Custom OpenAI-compatible endpoint")
+                        else:
+                            print(f"(>_<) Could not resolve credentials for provider '{provider_label}': {e}")
+                        print(f"(^_^) Current model unchanged: {self.model}")
+                        return True
+
+                try:
+                    validation = validate_requested_model(
+                        new_model,
+                        target_provider,
+                        api_key=api_key_for_probe,
+                        base_url=base_url_for_probe,
+                    )
+                except Exception:
+                    validation = {"accepted": True, "persist": True, "recognized": False, "message": None}
+
+                if not validation.get("accepted"):
+                    print(f"(>_<) {validation.get('message')}")
+                    print(f"  Model unchanged: {self.model}")
+                    if "Did you mean" not in (validation.get("message") or ""):
+                        print("  Tip: Use /model to see available models, /provider to see providers")
                 else:
-                    print(f"(^_^) Model changed to: {new_model} (session only)")
+                    self.model = new_model
+                    self.agent = None  # Force re-init
+
+                    if provider_changed:
+                        self.requested_provider = target_provider
+                        self.provider = target_provider
+                        self.api_key = api_key_for_probe
+                        self.base_url = base_url_for_probe
+
+                    provider_label = _PROVIDER_LABELS.get(target_provider, target_provider)
+                    provider_note = f" [provider: {provider_label}]" if provider_changed else ""
+
+                    if validation.get("persist"):
+                        saved_model = save_config_value("model.default", new_model)
+                        if provider_changed:
+                            save_config_value("model.provider", target_provider)
+                        if saved_model:
+                            print(f"(^_^)b Model changed to: {new_model}{provider_note} (saved to config)")
+                        else:
+                            print(f"(^_^) Model changed to: {new_model}{provider_note} (this session only)")
+                    else:
+                        message = validation.get("message") or ""
+                        print(f"(^_^) Model changed to: {new_model}{provider_note} (this session only)")
+                        if message:
+                            print(f"  Reason: {message}")
+                        print("  Note: Model will revert on restart. Use a verified model to save to config.")
             else:
-                print(f"Current model: {self.model}")
-                print("  Usage: /model <model-name> to change")
+                self._show_model_and_providers()
+        elif cmd_lower == "/provider":
+            self._show_model_and_providers()
         elif cmd_lower.startswith("/prompt"):
             # Use original case so prompt text isn't lowercased
             self._handle_prompt_command(cmd_original)
@@ -1687,17 +2871,217 @@ class HermesCLI:
         elif cmd_lower.startswith("/cron"):
             self._handle_cron_command(cmd_original)
         elif cmd_lower.startswith("/skills"):
-            self._handle_skills_command(cmd_original)
+            with self._busy_command(self._slow_command_status(cmd_original)):
+                self._handle_skills_command(cmd_original)
         elif cmd_lower == "/platforms" or cmd_lower == "/gateway":
             self._show_gateway_status()
         elif cmd_lower == "/verbose":
             self._toggle_verbose()
+        elif cmd_lower.startswith("/reasoning"):
+            self._handle_reasoning_command(cmd_original)
+        elif cmd_lower == "/compress":
+            self._manual_compress()
+        elif cmd_lower == "/usage":
+            self._show_usage()
+        elif cmd_lower.startswith("/insights"):
+            self._show_insights(cmd_original)
+        elif cmd_lower == "/paste":
+            self._handle_paste_command()
+        elif cmd_lower == "/reload-mcp":
+            with self._busy_command(self._slow_command_status(cmd_original)):
+                self._reload_mcp()
+        elif cmd_lower.startswith("/rollback"):
+            self._handle_rollback_command(cmd_original)
+        elif cmd_lower.startswith("/background"):
+            self._handle_background_command(cmd_original)
+        elif cmd_lower.startswith("/skin"):
+            self._handle_skin_command(cmd_original)
         else:
-            self.console.print(f"[bold red]Unknown command: {cmd_lower}[/]")
-            self.console.print("[dim #B8860B]Type /help for available commands[/]")
+            # Check for user-defined quick commands (bypass agent loop, no LLM call)
+            base_cmd = cmd_lower.split()[0]
+            quick_commands = self.config.get("quick_commands", {})
+            if base_cmd.lstrip("/") in quick_commands:
+                qcmd = quick_commands[base_cmd.lstrip("/")]
+                if qcmd.get("type") == "exec":
+                    import subprocess
+                    exec_cmd = qcmd.get("command", "")
+                    if exec_cmd:
+                        try:
+                            result = subprocess.run(
+                                exec_cmd, shell=True, capture_output=True,
+                                text=True, timeout=30
+                            )
+                            output = result.stdout.strip() or result.stderr.strip()
+                            self.console.print(output if output else "[dim]Command returned no output[/]")
+                        except subprocess.TimeoutExpired:
+                            self.console.print("[bold red]Quick command timed out (30s)[/]")
+                        except Exception as e:
+                            self.console.print(f"[bold red]Quick command error: {e}[/]")
+                    else:
+                        self.console.print(f"[bold red]Quick command '{base_cmd}' has no command defined[/]")
+                else:
+                    self.console.print(f"[bold red]Quick command '{base_cmd}' has unsupported type (only 'exec' is supported)[/]")
+            # Check for skill slash commands (/gif-search, /axolotl, etc.)
+            elif base_cmd in _skill_commands:
+                user_instruction = cmd_original[len(base_cmd):].strip()
+                msg = build_skill_invocation_message(base_cmd, user_instruction)
+                if msg:
+                    skill_name = _skill_commands[base_cmd]["name"]
+                    print(f"\n⚡ Loading skill: {skill_name}")
+                    if hasattr(self, '_pending_input'):
+                        self._pending_input.put(msg)
+                else:
+                    self.console.print(f"[bold red]Failed to load skill for {base_cmd}[/]")
+            else:
+                self.console.print(f"[bold red]Unknown command: {cmd_lower}[/]")
+                self.console.print("[dim #B8860B]Type /help for available commands[/]")
         
         return True
     
+    def _handle_background_command(self, cmd: str):
+        """Handle /background <prompt> — run a prompt in a separate background session.
+
+        Spawns a new AIAgent in a background thread with its own session.
+        When it completes, prints the result to the CLI without modifying
+        the active session's conversation history.
+        """
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /background <prompt>")
+            _cprint("  Example: /background Summarize the top HN stories today")
+            _cprint("  The task runs in a separate session and results display here when done.")
+            return
+
+        prompt = parts[1].strip()
+        self._background_task_counter += 1
+        task_num = self._background_task_counter
+        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+        # Make sure we have valid credentials
+        if not self._ensure_runtime_credentials():
+            _cprint("  (>_<) Cannot start background task: no valid credentials.")
+            return
+
+        _cprint(f"  🔄 Background task #{task_num} started: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
+        _cprint(f"  Task ID: {task_id}")
+        _cprint(f"  You can continue chatting — results will appear when done.\n")
+
+        def run_background():
+            try:
+                bg_agent = AIAgent(
+                    model=self.model,
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                    provider=self.provider,
+                    api_mode=self.api_mode,
+                    max_iterations=self.max_turns,
+                    enabled_toolsets=self.enabled_toolsets,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    session_id=task_id,
+                    platform="cli",
+                    session_db=self._session_db,
+                    reasoning_config=self.reasoning_config,
+                    providers_allowed=self._providers_only,
+                    providers_ignored=self._providers_ignore,
+                    providers_order=self._providers_order,
+                    provider_sort=self._provider_sort,
+                    provider_require_parameters=self._provider_require_params,
+                    provider_data_collection=self._provider_data_collection,
+                    fallback_model=self._fallback_model,
+                )
+
+                result = bg_agent.run_conversation(
+                    user_message=prompt,
+                    task_id=task_id,
+                )
+
+                response = result.get("final_response", "") if result else ""
+                if not response and result and result.get("error"):
+                    response = f"Error: {result['error']}"
+
+                # Display result in the CLI (thread-safe via patch_stdout)
+                print()
+                _cprint(f"{_GOLD}{'─' * 40}{_RST}")
+                _cprint(f"  ✅ Background task #{task_num} complete")
+                _cprint(f"  Prompt: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
+                _cprint(f"{_GOLD}{'─' * 40}{_RST}")
+                if response:
+                    try:
+                        from hermes_cli.skin_engine import get_active_skin
+                        _skin = get_active_skin()
+                        label = _skin.get_branding("response_label", "⚕ Hermes")
+                        _resp_color = _skin.get_color("response_border", "#CD7F32")
+                    except Exception:
+                        label = "⚕ Hermes"
+                        _resp_color = "#CD7F32"
+
+                    _chat_console = ChatConsole()
+                    _chat_console.print(Panel(
+                        response,
+                        title=f"[bold]{label} (background #{task_num})[/bold]",
+                        title_align="left",
+                        border_style=_resp_color,
+                        box=rich_box.HORIZONTALS,
+                        padding=(1, 2),
+                    ))
+                else:
+                    _cprint("  (No response generated)")
+
+                # Play bell if enabled
+                if self.bell_on_complete:
+                    sys.stdout.write("\a")
+                    sys.stdout.flush()
+
+            except Exception as e:
+                print()
+                _cprint(f"  ❌ Background task #{task_num} failed: {e}")
+            finally:
+                self._background_tasks.pop(task_id, None)
+                if self._app:
+                    self._invalidate(min_interval=0)
+
+        thread = threading.Thread(target=run_background, daemon=True, name=f"bg-task-{task_id}")
+        self._background_tasks[task_id] = thread
+        thread.start()
+
+    def _handle_skin_command(self, cmd: str):
+        """Handle /skin [name] — show or change the display skin."""
+        try:
+            from hermes_cli.skin_engine import list_skins, set_active_skin, get_active_skin_name
+        except ImportError:
+            print("Skin engine not available.")
+            return
+
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            # Show current skin and list available
+            current = get_active_skin_name()
+            skins = list_skins()
+            print(f"\n  Current skin: {current}")
+            print(f"  Available skins:")
+            for s in skins:
+                marker = " ●" if s["name"] == current else "  "
+                source = f" ({s['source']})" if s["source"] == "user" else ""
+                print(f"   {marker} {s['name']}{source} — {s['description']}")
+            print(f"\n  Usage: /skin <name>")
+            print(f"  Custom skins: drop a YAML file in ~/.hermes/skins/\n")
+            return
+
+        new_skin = parts[1].strip().lower()
+        available = {s["name"] for s in list_skins()}
+        if new_skin not in available:
+            print(f"  Unknown skin: {new_skin}")
+            print(f"  Available: {', '.join(sorted(available))}")
+            return
+
+        set_active_skin(new_skin)
+        if save_config_value("display.skin", new_skin):
+            print(f"  Skin set to: {new_skin} (saved)")
+        else:
+            print(f"  Skin set to: {new_skin}")
+        print("  Note: banner colors will update on next session start.")
+
     def _toggle_verbose(self):
         """Cycle tool progress mode: off → new → all → verbose → off."""
         cycle = ["off", "new", "all", "verbose"]
@@ -1720,6 +3104,148 @@ class HermesCLI:
         }
         self.console.print(labels.get(self.tool_progress_mode, ""))
 
+    def _handle_reasoning_command(self, cmd: str):
+        """Handle /reasoning — manage effort level and display toggle.
+
+        Usage:
+            /reasoning              Show current effort level and display state
+            /reasoning <level>      Set reasoning effort (none, low, medium, high, xhigh)
+            /reasoning show|on      Show model thinking/reasoning in output
+            /reasoning hide|off     Hide model thinking/reasoning from output
+        """
+        parts = cmd.strip().split(maxsplit=1)
+
+        if len(parts) < 2:
+            # Show current state
+            rc = self.reasoning_config
+            if rc is None:
+                level = "medium (default)"
+            elif rc.get("enabled") is False:
+                level = "none (disabled)"
+            else:
+                level = rc.get("effort", "medium")
+            display_state = "on ✓" if self.show_reasoning else "off"
+            _cprint(f"  {_GOLD}Reasoning effort:  {level}{_RST}")
+            _cprint(f"  {_GOLD}Reasoning display: {display_state}{_RST}")
+            _cprint(f"  {_DIM}Usage: /reasoning <none|low|medium|high|xhigh|show|hide>{_RST}")
+            return
+
+        arg = parts[1].strip().lower()
+
+        # Display toggle
+        if arg in ("show", "on"):
+            self.show_reasoning = True
+            if self.agent:
+                self.agent.reasoning_callback = self._on_reasoning
+            save_config_value("display.show_reasoning", True)
+            _cprint(f"  {_GOLD}✓ Reasoning display: ON (saved){_RST}")
+            _cprint(f"  {_DIM}  Model thinking will be shown during and after each response.{_RST}")
+            return
+        if arg in ("hide", "off"):
+            self.show_reasoning = False
+            if self.agent:
+                self.agent.reasoning_callback = None
+            save_config_value("display.show_reasoning", False)
+            _cprint(f"  {_GOLD}✓ Reasoning display: OFF (saved){_RST}")
+            return
+
+        # Effort level change
+        parsed = _parse_reasoning_config(arg)
+        if parsed is None:
+            _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
+            _cprint(f"  {_DIM}Valid levels: none, low, minimal, medium, high, xhigh{_RST}")
+            _cprint(f"  {_DIM}Display:      show, hide{_RST}")
+            return
+
+        self.reasoning_config = parsed
+        self.agent = None  # Force agent re-init with new reasoning config
+
+        if save_config_value("agent.reasoning_effort", arg):
+            _cprint(f"  {_GOLD}✓ Reasoning effort set to '{arg}' (saved to config){_RST}")
+        else:
+            _cprint(f"  {_GOLD}✓ Reasoning effort set to '{arg}' (session only){_RST}")
+
+    def _on_reasoning(self, reasoning_text: str):
+        """Callback for intermediate reasoning display during tool-call loops."""
+        lines = reasoning_text.strip().splitlines()
+        if len(lines) > 5:
+            preview = "\n".join(lines[:5])
+            preview += f"\n  ... ({len(lines) - 5} more lines)"
+        else:
+            preview = reasoning_text.strip()
+        _cprint(f"  {_DIM}[thinking] {preview}{_RST}")
+
+    def _manual_compress(self):
+        """Manually trigger context compression on the current conversation."""
+        if not self.conversation_history or len(self.conversation_history) < 4:
+            print("(._.) Not enough conversation to compress (need at least 4 messages).")
+            return
+
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        if not self.agent.compression_enabled:
+            print("(._.) Compression is disabled in config.")
+            return
+
+        original_count = len(self.conversation_history)
+        try:
+            from agent.model_metadata import estimate_messages_tokens_rough
+            approx_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(f"🗜️  Compressing {original_count} messages (~{approx_tokens:,} tokens)...")
+
+            compressed, new_system = self.agent._compress_context(
+                self.conversation_history,
+                self.agent._cached_system_prompt or "",
+                approx_tokens=approx_tokens,
+            )
+            self.conversation_history = compressed
+            new_count = len(self.conversation_history)
+            new_tokens = estimate_messages_tokens_rough(self.conversation_history)
+            print(
+                f"  ✅ Compressed: {original_count} → {new_count} messages "
+                f"(~{approx_tokens:,} → ~{new_tokens:,} tokens)"
+            )
+        except Exception as e:
+            print(f"  ❌ Compression failed: {e}")
+
+    def _show_usage(self):
+        """Show cumulative token usage for the current session."""
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+
+        agent = self.agent
+        prompt = agent.session_prompt_tokens
+        completion = agent.session_completion_tokens
+        total = agent.session_total_tokens
+        calls = agent.session_api_calls
+
+        if calls == 0:
+            print("(._.) No API calls made yet in this session.")
+            return
+
+        # Current context window state
+        compressor = agent.context_compressor
+        last_prompt = compressor.last_prompt_tokens
+        ctx_len = compressor.context_length
+        pct = (last_prompt / ctx_len * 100) if ctx_len else 0
+        compressions = compressor.compression_count
+
+        msg_count = len(self.conversation_history)
+
+        print(f"  📊 Session Token Usage")
+        print(f"  {'─' * 40}")
+        print(f"  Prompt tokens (input):     {prompt:>10,}")
+        print(f"  Completion tokens (output): {completion:>9,}")
+        print(f"  Total tokens:              {total:>10,}")
+        print(f"  API calls:                 {calls:>10,}")
+        print(f"  {'─' * 40}")
+        print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
+        print(f"  Messages:         {msg_count}")
+        print(f"  Compressions:     {compressions}")
+
         if self.verbose:
             logging.getLogger().setLevel(logging.DEBUG)
             for noisy in ('openai', 'openai._base_client', 'httpx', 'httpcore', 'asyncio', 'hpack', 'grpc', 'modal'):
@@ -1728,6 +3254,125 @@ class HermesCLI:
             logging.getLogger().setLevel(logging.INFO)
             for quiet_logger in ('tools', 'minisweagent', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+
+    def _show_insights(self, command: str = "/insights"):
+        """Show usage insights and analytics from session history."""
+        # Parse optional --days flag
+        parts = command.split()
+        days = 30
+        source = None
+        i = 1
+        while i < len(parts):
+            if parts[i] == "--days" and i + 1 < len(parts):
+                try:
+                    days = int(parts[i + 1])
+                except ValueError:
+                    print(f"  Invalid --days value: {parts[i + 1]}")
+                    return
+                i += 2
+            elif parts[i] == "--source" and i + 1 < len(parts):
+                source = parts[i + 1]
+                i += 2
+            else:
+                i += 1
+
+        try:
+            from hermes_state import SessionDB
+            from agent.insights import InsightsEngine
+
+            db = SessionDB()
+            engine = InsightsEngine(db)
+            report = engine.generate(days=days, source=source)
+            print(engine.format_terminal(report))
+            db.close()
+        except Exception as e:
+            print(f"  Error generating insights: {e}")
+
+    def _reload_mcp(self):
+        """Reload MCP servers: disconnect all, re-read config.yaml, reconnect.
+
+        After reconnecting, refreshes the agent's tool list so the model
+        sees the updated tools on the next turn.
+        """
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _load_mcp_config, _servers, _lock
+
+            # Capture old server names
+            with _lock:
+                old_servers = set(_servers.keys())
+
+            if not self._command_running:
+                print("🔄 Reloading MCP servers...")
+
+            # Shutdown existing connections
+            shutdown_mcp_servers()
+
+            # Reconnect (reads config.yaml fresh)
+            new_tools = discover_mcp_tools()
+
+            # Compute what changed
+            with _lock:
+                connected_servers = set(_servers.keys())
+
+            added = connected_servers - old_servers
+            removed = old_servers - connected_servers
+            reconnected = connected_servers & old_servers
+
+            if reconnected:
+                print(f"  ♻️  Reconnected: {', '.join(sorted(reconnected))}")
+            if added:
+                print(f"  ➕ Added: {', '.join(sorted(added))}")
+            if removed:
+                print(f"  ➖ Removed: {', '.join(sorted(removed))}")
+            if not connected_servers:
+                print("  No MCP servers connected.")
+            else:
+                print(f"  🔧 {len(new_tools)} tool(s) available from {len(connected_servers)} server(s)")
+
+            # Refresh the agent's tool list so the model can call new tools
+            if self.agent is not None:
+                from model_tools import get_tool_definitions
+                self.agent.tools = get_tool_definitions(
+                    enabled_toolsets=self.agent.enabled_toolsets
+                    if hasattr(self.agent, "enabled_toolsets") else None,
+                    quiet_mode=True,
+                )
+                self.agent.valid_tool_names = {
+                    tool["function"]["name"] for tool in self.agent.tools
+                } if self.agent.tools else set()
+
+            # Inject a message at the END of conversation history so the
+            # model knows tools changed.  Appended after all existing
+            # messages to preserve prompt-cache for the prefix.
+            change_parts = []
+            if added:
+                change_parts.append(f"Added servers: {', '.join(sorted(added))}")
+            if removed:
+                change_parts.append(f"Removed servers: {', '.join(sorted(removed))}")
+            if reconnected:
+                change_parts.append(f"Reconnected servers: {', '.join(sorted(reconnected))}")
+            tool_summary = f"{len(new_tools)} MCP tool(s) now available" if new_tools else "No MCP tools available"
+            change_detail = ". ".join(change_parts) + ". " if change_parts else ""
+            self.conversation_history.append({
+                "role": "user",
+                "content": f"[SYSTEM: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
+            })
+
+            # Persist session immediately so the session log reflects the
+            # updated tools list (self.agent.tools was refreshed above).
+            if self.agent is not None:
+                try:
+                    self.agent._persist_session(
+                        self.conversation_history,
+                        self.conversation_history,
+                    )
+                except Exception:
+                    pass  # Best-effort
+
+            print(f"  ✅ Agent updated — {len(self.agent.tools if self.agent else [])} tool(s) available")
+
+        except Exception as e:
+            print(f"  ❌ MCP reload failed: {e}")
 
     def _clarify_callback(self, question, choices):
         """
@@ -1755,11 +3400,18 @@ class HermesCLI:
         self._clarify_freetext = is_open_ended
 
         # Trigger prompt_toolkit repaint from this (non-main) thread
-        if hasattr(self, '_app') and self._app:
-            self._app.invalidate()
+        self._invalidate()
 
-        # Poll in 1-second ticks so the countdown refreshes in the UI.
-        # Each tick triggers an invalidate() to repaint the hint line.
+        # Poll for the user's response.  The countdown in the hint line
+        # updates on each invalidate — but frequent repaints cause visible
+        # flicker in some terminals (Kitty, ghostty).  We only refresh the
+        # countdown every 5 s; selection changes (↑/↓) trigger instant
+        # Poll for the user's response.  The countdown in the hint line
+        # updates on each invalidate — but frequent repaints cause visible
+        # flicker in some terminals (Kitty, ghostty).  We only refresh the
+        # countdown every 5 s; selection changes (↑/↓) trigger instant
+        # repaints via the key bindings.
+        _last_countdown_refresh = _time.monotonic()
         while True:
             try:
                 result = response_queue.get(timeout=1)
@@ -1769,16 +3421,20 @@ class HermesCLI:
                 remaining = self._clarify_deadline - _time.monotonic()
                 if remaining <= 0:
                     break
-                # Repaint so the countdown updates
-                if hasattr(self, '_app') and self._app:
-                    self._app.invalidate()
+                # Only repaint every 5 s for the countdown — avoids flicker
+                now = _time.monotonic()
+                if now - _last_countdown_refresh >= 5.0:
+                    _last_countdown_refresh = now
+                    self._invalidate()
+                if now - _last_countdown_refresh >= 5.0:
+                    _last_countdown_refresh = now
+                    self._invalidate()
 
         # Timed out — tear down the UI and let the agent decide
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
-        if hasattr(self, '_app') and self._app:
-            self._app.invalidate()
+        self._invalidate()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
         return (
             "The user did not provide a response within the time limit. "
@@ -1803,16 +3459,14 @@ class HermesCLI:
         }
         self._sudo_deadline = _time.monotonic() + timeout
 
-        if hasattr(self, '_app') and self._app:
-            self._app.invalidate()
+        self._invalidate()
 
         while True:
             try:
                 result = response_queue.get(timeout=1)
                 self._sudo_state = None
                 self._sudo_deadline = 0
-                if hasattr(self, '_app') and self._app:
-                    self._app.invalidate()
+                self._invalidate()
                 if result:
                     _cprint(f"\n{_DIM}  ✓ Password received (cached for session){_RST}")
                 else:
@@ -1822,13 +3476,11 @@ class HermesCLI:
                 remaining = self._sudo_deadline - _time.monotonic()
                 if remaining <= 0:
                     break
-                if hasattr(self, '_app') and self._app:
-                    self._app.invalidate()
+                self._invalidate()
 
         self._sudo_state = None
         self._sudo_deadline = 0
-        if hasattr(self, '_app') and self._app:
-            self._app.invalidate()
+        self._invalidate()
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
         return ""
 
@@ -1854,34 +3506,38 @@ class HermesCLI:
         }
         self._approval_deadline = _time.monotonic() + timeout
 
-        if hasattr(self, '_app') and self._app:
-            self._app.invalidate()
+        self._invalidate()
 
+        # Same throttled countdown as _clarify_callback — repaint only
+        # every 5 s to avoid flicker in Kitty / ghostty / etc.
+        _last_countdown_refresh = _time.monotonic()
         while True:
             try:
                 result = response_queue.get(timeout=1)
                 self._approval_state = None
                 self._approval_deadline = 0
-                if hasattr(self, '_app') and self._app:
-                    self._app.invalidate()
+                self._invalidate()
                 return result
             except queue.Empty:
                 remaining = self._approval_deadline - _time.monotonic()
                 if remaining <= 0:
                     break
-                if hasattr(self, '_app') and self._app:
-                    self._app.invalidate()
+                now = _time.monotonic()
+                if now - _last_countdown_refresh >= 5.0:
+                    _last_countdown_refresh = now
+                    self._invalidate()
 
         self._approval_state = None
         self._approval_deadline = 0
-        if hasattr(self, '_app') and self._app:
-            self._app.invalidate()
-        _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
+        self._invalidate()
         return "deny"
 
-    def chat(self, message: str) -> Optional[str]:
+    def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
+        
+        Handles streaming output, interrupt detection (user typing while agent
+        is working), and re-queueing of interrupted messages.
         
         Uses a dedicated _interrupt_queue (separate from _pending_input) to avoid
         race conditions between the process_loop and interrupt monitoring. Messages
@@ -1889,24 +3545,32 @@ class HermesCLI:
         idle go to _pending_input.
         
         Args:
-            message: The user's message
+            message: The user's message (str or multimodal content list)
+            images: Optional list of Path objects for attached images
             
         Returns:
             The agent's response, or None on error
         """
-        # Refresh OAuth credentials if needed (handles key rotation transparently)
-        if self.provider == "nous" and not self._ensure_runtime_credentials():
+        # Refresh provider credentials if needed (handles key rotation transparently)
+        if not self._ensure_runtime_credentials():
             return None
 
         # Initialize agent if needed
         if not self._init_agent():
             return None
         
+        # Pre-process images through the vision tool (Gemini Flash) so the
+        # main model receives text descriptions instead of raw base64 image
+        # content — works with any model, not just vision-capable ones.
+        if images:
+            message = self._preprocess_images_with_vision(
+                message if isinstance(message, str) else "", images
+            )
+
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
         
-        w = self.console.width
-        _cprint(f"{_GOLD}{'─' * w}{_RST}")
+        _cprint(f"{_GOLD}{'─' * 40}{_RST}")
         print(flush=True)
         
         try:
@@ -1918,6 +3582,7 @@ class HermesCLI:
                 result = self.agent.run_conversation(
                     user_message=message,
                     conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                    task_id=self.session_id,
                 )
             
             # Start agent in background thread
@@ -1943,6 +3608,19 @@ class HermesCLI:
                                 continue
                             print(f"\n⚡ New message detected, interrupting...")
                             self.agent.interrupt(interrupt_msg)
+                            # Debug: log to file (stdout may be devnull from redirect_stdout)
+                            try:
+                                import pathlib as _pl
+                                _dbg = _pl.Path.home() / ".hermes" / "interrupt_debug.log"
+                                with open(_dbg, "a") as _f:
+                                    import time as _t
+                                    _f.write(f"{_t.strftime('%H:%M:%S')} interrupt fired: msg={str(interrupt_msg)[:60]!r}, "
+                                             f"children={len(self.agent._active_children)}, "
+                                             f"parent._interrupt={self.agent._interrupt_requested}\n")
+                                    for _ci, _ch in enumerate(self.agent._active_children):
+                                        _f.write(f"  child[{_ci}]._interrupt={_ch._interrupt_requested}\n")
+                            except Exception:
+                                pass
                             break
                     except queue.Empty:
                         pass  # Queue empty or timeout, continue waiting
@@ -1979,16 +3657,51 @@ class HermesCLI:
                 if response and pending_message:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"
             
-            if response:
-                w = self.console.width
-                label = " ⚕ Hermes "
-                fill = w - 2 - len(label)  # 2 for ╭ and ╮
-                top = f"{_GOLD}╭─{label}{'─' * max(fill - 1, 0)}╮{_RST}"
-                bot = f"{_GOLD}╰{'─' * (w - 2)}╯{_RST}"
+            # Display reasoning (thinking) box if enabled and available
+            if self.show_reasoning and result:
+                reasoning = result.get("last_reasoning")
+                if reasoning:
+                    w = shutil.get_terminal_size().columns
+                    r_label = " Reasoning "
+                    r_fill = w - 2 - len(r_label)
+                    r_top = f"{_DIM}┌─{r_label}{'─' * max(r_fill - 1, 0)}┐{_RST}"
+                    r_bot = f"{_DIM}└{'─' * (w - 2)}┘{_RST}"
+                    # Collapse long reasoning: show first 10 lines
+                    lines = reasoning.strip().splitlines()
+                    if len(lines) > 10:
+                        display_reasoning = "\n".join(lines[:10])
+                        display_reasoning += f"\n{_DIM}  ... ({len(lines) - 10} more lines){_RST}"
+                    else:
+                        display_reasoning = reasoning.strip()
+                    _cprint(f"\n{r_top}\n{_DIM}{display_reasoning}{_RST}\n{r_bot}")
 
-                # Render box + response as a single _cprint call so
-                # nothing can interleave between the box borders.
-                _cprint(f"\n{top}\n{response}\n\n{bot}")
+            if response:
+                # Use a Rich Panel for the response box — adapts to terminal
+                # width at render time instead of hard-coding border length.
+                try:
+                    from hermes_cli.skin_engine import get_active_skin
+                    _skin = get_active_skin()
+                    label = _skin.get_branding("response_label", "⚕ Hermes")
+                    _resp_color = _skin.get_color("response_border", "#CD7F32")
+                except Exception:
+                    label = "⚕ Hermes"
+                    _resp_color = "#CD7F32"
+
+                _chat_console = ChatConsole()
+                _chat_console.print(Panel(
+                    response,
+                    title=f"[bold]{label}[/bold]",
+                    title_align="left",
+                    border_style=_resp_color,
+                    box=rich_box.HORIZONTALS,
+                    padding=(1, 2),
+                ))
+            
+            # Play terminal bell when agent finishes (if enabled).
+            # Works over SSH — the bell propagates to the user's terminal.
+            if self.bell_on_complete:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
             
             # Combine all interrupt messages (user may have typed multiple while waiting)
             # and re-queue as one prompt for process_loop
@@ -2040,7 +3753,22 @@ class HermesCLI:
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
         self.show_banner()
-        self.console.print("[#FFF8DC]Welcome to Hermes Agent! Type your message or /help for commands.[/]")
+
+        # If resuming a session, load history and display it immediately
+        # so the user has context before typing their first message.
+        if self._resumed:
+            if self._preload_resumed_session():
+                self._display_resumed_history()
+
+        try:
+            from hermes_cli.skin_engine import get_active_skin
+            _welcome_skin = get_active_skin()
+            _welcome_text = _welcome_skin.get_branding("welcome", "Welcome to Hermes Agent! Type your message or /help for commands.")
+            _welcome_color = _welcome_skin.get_color("banner_text", "#FFF8DC")
+        except Exception:
+            _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
+            _welcome_color = "#FFF8DC"
+        self.console.print(f"[{_welcome_color}]{_welcome_text}[/]")
         self.console.print()
         
         # State for async operation
@@ -2064,6 +3792,14 @@ class HermesCLI:
         # Dangerous command approval state (similar mechanism to clarify)
         self._approval_state = None     # dict with command, description, choices, selected, response_queue
         self._approval_deadline = 0
+
+        # Slash command loading state
+        self._command_running = False
+        self._command_status = ""
+
+        # Clipboard image attachments (paste images into the CLI)
+        self._attached_images: list[Path] = []
+        self._image_counter = 0
 
         # Register callbacks so terminal_tool prompts route through our UI
         set_sudo_password_callback(self._sudo_password_callback)
@@ -2101,7 +3837,17 @@ class HermesCLI:
                 selected = state["selected"]
                 choices = state["choices"]
                 if 0 <= selected < len(choices):
-                    state["response_queue"].put(choices[selected])
+                    chosen = choices[selected]
+                    if chosen == "view":
+                        # Toggle full command display without closing the prompt
+                        state["show_full"] = True
+                        # Remove the "view" option since it's been used
+                        state["choices"] = [c for c in choices if c != "view"]
+                        if state["selected"] >= len(state["choices"]):
+                            state["selected"] = len(state["choices"]) - 1
+                        event.app.invalidate()
+                        return
+                    state["response_queue"].put(chosen)
                 self._approval_state = None
                 event.app.invalidate()
                 return
@@ -2134,12 +3880,29 @@ class HermesCLI:
 
             # --- Normal input routing ---
             text = event.app.current_buffer.text.strip()
-            if text:
-                if self._agent_running and not text.startswith("/"):
-                    self._interrupt_queue.put(text)
+            has_images = bool(self._attached_images)
+            if text or has_images:
+                # Snapshot and clear attached images
+                images = list(self._attached_images)
+                self._attached_images.clear()
+                event.app.invalidate()
+                # Bundle text + images as a tuple when images are present
+                payload = (text, images) if images else text
+                if self._agent_running and not (text and text.startswith("/")):
+                    self._interrupt_queue.put(payload)
+                    # Debug: log to file when message enters interrupt queue
+                    try:
+                        import pathlib as _pl
+                        _dbg = _pl.Path.home() / ".hermes" / "interrupt_debug.log"
+                        with open(_dbg, "a") as _f:
+                            import time as _t
+                            _f.write(f"{_t.strftime('%H:%M:%S')} ENTER: queued interrupt msg={str(payload)[:60]!r}, "
+                                     f"agent_running={self._agent_running}\n")
+                    except Exception:
+                        pass
                 else:
-                    self._pending_input.put(text)
-                event.app.current_buffer.reset()
+                    self._pending_input.put(payload)
+                event.app.current_buffer.reset(append_to_history=True)
         
         @kb.add('escape', 'enter')
         def handle_alt_enter(event):
@@ -2183,6 +3946,24 @@ class HermesCLI:
                 max_idx = len(self._approval_state["choices"]) - 1
                 self._approval_state["selected"] = min(max_idx, self._approval_state["selected"] + 1)
                 event.app.invalidate()
+
+        # --- History navigation: up/down browse history in normal input mode ---
+        # The TextArea is multiline, so by default up/down only move the cursor.
+        # Buffer.auto_up/auto_down handle both: cursor movement when multi-line,
+        # history browsing when on the first/last line (or single-line input).
+        _normal_input = Condition(
+            lambda: not self._clarify_state and not self._approval_state and not self._sudo_state
+        )
+
+        @kb.add('up', filter=_normal_input)
+        def history_up(event):
+            """Up arrow: browse history when on first line, else move cursor up."""
+            event.app.current_buffer.auto_up(count=event.arg)
+
+        @kb.add('down', filter=_normal_input)
+        def history_down(event):
+            """Down arrow: browse history when on last line, else move cursor down."""
+            event.app.current_buffer.auto_down(count=event.arg)
 
         @kb.add('c-c')
         def handle_ctrl_c(event):
@@ -2233,15 +4014,68 @@ class HermesCLI:
                 print("\n⚡ Interrupting agent... (press Ctrl+C again to force exit)")
                 self.agent.interrupt()
             else:
-                self._should_exit = True
-                event.app.exit()
+                # If there's text or images, clear them (like bash).
+                # If everything is already empty, exit.
+                if event.app.current_buffer.text or self._attached_images:
+                    event.app.current_buffer.reset()
+                    self._attached_images.clear()
+                    event.app.invalidate()
+                else:
+                    self._should_exit = True
+                    event.app.exit()
         
         @kb.add('c-d')
         def handle_ctrl_d(event):
             """Handle Ctrl+D - exit."""
             self._should_exit = True
             event.app.exit()
-        
+
+        from prompt_toolkit.keys import Keys
+
+        @kb.add(Keys.BracketedPaste, eager=True)
+        def handle_paste(event):
+            """Handle terminal paste — detect clipboard images.
+
+            When the terminal supports bracketed paste, Ctrl+V / Cmd+V
+            triggers this with the pasted text.  We also check the
+            clipboard for an image on every paste event.
+            """
+            pasted_text = event.data or ""
+            if self._try_attach_clipboard_image():
+                event.app.invalidate()
+            if pasted_text:
+                event.current_buffer.insert_text(pasted_text)
+
+        @kb.add('c-v')
+        def handle_ctrl_v(event):
+            """Fallback image paste for terminals without bracketed paste.
+
+            On Linux terminals (GNOME Terminal, Konsole, etc.), Ctrl+V
+            sends raw byte 0x16 instead of triggering a paste.  This
+            binding catches that and checks the clipboard for images.
+            On terminals that DO intercept Ctrl+V for paste (macOS
+            Terminal, iTerm2, VSCode, Windows Terminal), the bracketed
+            paste handler fires instead and this binding never triggers.
+            """
+            if self._try_attach_clipboard_image():
+                event.app.invalidate()
+
+        @kb.add('escape', 'v')
+        def handle_alt_v(event):
+            """Alt+V — paste image from clipboard.
+
+            Alt key combos pass through all terminal emulators (sent as
+            ESC + key), unlike Ctrl+V which terminals intercept for text
+            paste.  This is the reliable way to attach clipboard images
+            on WSL2, VSCode, and any terminal over SSH where Ctrl+V
+            can't reach the application for image-only clipboard.
+            """
+            if self._try_attach_clipboard_image():
+                event.app.invalidate()
+            else:
+                # No image found — show a hint
+                pass  # silent when no image (avoid noise on accidental press)
+
         # Dynamic prompt: shows Hermes symbol when agent is working,
         # or answer prompt when clarify freetext mode is active.
         cli_ref = self
@@ -2255,6 +4089,8 @@ class HermesCLI:
                 return [('class:clarify-selected', '✎ ❯ ')]
             if cli_ref._clarify_state:
                 return [('class:prompt-working', '? ❯ ')]
+            if cli_ref._command_running:
+                return [('class:prompt-working', f"{cli_ref._command_spinner_frame()} ❯ ")]
             if cli_ref._agent_running:
                 return [('class:prompt-working', '⚕ ❯ ')]
             return [('class:prompt', '❯ ')]
@@ -2266,8 +4102,9 @@ class HermesCLI:
             style='class:input-area',
             multiline=True,
             wrap_lines=True,
+            read_only=Condition(lambda: bool(cli_ref._command_running)),
             history=FileHistory(str(self._history_file)),
-            completer=SlashCommandCompleter(),
+            completer=SlashCommandCompleter(skill_commands_provider=lambda: _skill_commands),
             complete_while_typing=True,
         )
 
@@ -2277,7 +4114,7 @@ class HermesCLI:
         def _input_height():
             try:
                 doc = input_area.buffer.document
-                available_width = (cli_ref.console.width or 80) - 4  # subtract prompt width
+                available_width = shutil.get_terminal_size().columns - 4  # subtract prompt width
                 if available_width < 10:
                     available_width = 40
                 visual_lines = 0
@@ -2346,8 +4183,14 @@ class HermesCLI:
                 return "type password (hidden), Enter to skip"
             if cli_ref._approval_state:
                 return ""
+            if cli_ref._clarify_freetext:
+                return "type your answer here and press Enter"
             if cli_ref._clarify_state:
                 return ""
+            if cli_ref._command_running:
+                frame = cli_ref._command_spinner_frame()
+                status = cli_ref._command_status or "Processing command..."
+                return f"{frame} {status}"
             if cli_ref._agent_running:
                 return "type a message + Enter to interrupt, Ctrl+C to cancel"
             return ""
@@ -2387,14 +4230,34 @@ class HermesCLI:
                     ('class:clarify-countdown', countdown),
                 ]
 
+            if cli_ref._command_running:
+                frame = cli_ref._command_spinner_frame()
+                return [
+                    ('class:hint', f'  {frame} command in progress · input temporarily disabled'),
+                ]
+
             return []
 
         def get_hint_height():
-            if cli_ref._sudo_state or cli_ref._approval_state or cli_ref._clarify_state:
+            if cli_ref._sudo_state or cli_ref._approval_state or cli_ref._clarify_state or cli_ref._command_running:
                 return 1
             # Keep a 1-line spacer while agent runs so output doesn't push
             # right up against the top rule of the input area
             return 1 if cli_ref._agent_running else 0
+
+        def get_spinner_text():
+            txt = cli_ref._spinner_text
+            if not txt:
+                return []
+            return [('class:hint', f'  {txt}')]
+
+        def get_spinner_height():
+            return 1 if cli_ref._spinner_text else 0
+
+        spinner_widget = Window(
+            content=FormattedTextControl(get_spinner_text),
+            height=get_spinner_height,
+        )
 
         spacer = Window(
             content=FormattedTextControl(get_hint_text),
@@ -2402,6 +4265,32 @@ class HermesCLI:
         )
 
         # --- Clarify tool: dynamic display widget for questions + choices ---
+
+        def _panel_box_width(title: str, content_lines: list[str], min_width: int = 46, max_width: int = 76) -> int:
+            """Choose a stable panel width wide enough for the title and content."""
+            term_cols = shutil.get_terminal_size((100, 20)).columns
+            longest = max([len(title)] + [len(line) for line in content_lines] + [min_width - 4])
+            inner = min(max(longest + 4, min_width - 2), max_width - 2, max(24, term_cols - 6))
+            return inner + 2  # account for the single leading/trailing spaces inside borders
+
+        def _wrap_panel_text(text: str, width: int, subsequent_indent: str = "") -> list[str]:
+            wrapped = textwrap.wrap(
+                text,
+                width=max(8, width),
+                break_long_words=False,
+                break_on_hyphens=False,
+                subsequent_indent=subsequent_indent,
+            )
+            return wrapped or [""]
+
+        def _append_panel_line(lines, border_style: str, content_style: str, text: str, box_width: int) -> None:
+            inner_width = max(0, box_width - 2)
+            lines.append((border_style, "│ "))
+            lines.append((content_style, text.ljust(inner_width)))
+            lines.append((border_style, " │\n"))
+
+        def _append_blank_panel_line(lines, border_style: str, box_width: int) -> None:
+            lines.append((border_style, "│" + (" " * box_width) + "│\n"))
 
         def _get_clarify_display():
             """Build styled text for the clarify question/choices panel."""
@@ -2412,43 +4301,62 @@ class HermesCLI:
             question = state["question"]
             choices = state.get("choices") or []
             selected = state.get("selected", 0)
+            preview_lines = _wrap_panel_text(question, 60)
+            for i, choice in enumerate(choices):
+                prefix = "❯ " if i == selected and not cli_ref._clarify_freetext else "  "
+                preview_lines.extend(_wrap_panel_text(f"{prefix}{choice}", 60, subsequent_indent="  "))
+            other_label = (
+                "❯ Other (type below)" if cli_ref._clarify_freetext
+                else "❯ Other (type your answer)" if selected == len(choices)
+                else "  Other (type your answer)"
+            )
+            preview_lines.extend(_wrap_panel_text(other_label, 60, subsequent_indent="  "))
+            box_width = _panel_box_width("Hermes needs your input", preview_lines)
+            inner_text_width = max(8, box_width - 2)
 
             lines = []
             # Box top border
             lines.append(('class:clarify-border', '╭─ '))
             lines.append(('class:clarify-title', 'Hermes needs your input'))
-            lines.append(('class:clarify-border', ' ─────────────────────────────╮\n'))
-            lines.append(('class:clarify-border', '│\n'))
+            lines.append(('class:clarify-border', ' ' + ('─' * max(0, box_width - len("Hermes needs your input") - 3)) + '╮\n'))
+            _append_blank_panel_line(lines, 'class:clarify-border', box_width)
 
             # Question text
-            lines.append(('class:clarify-border', '│  '))
-            lines.append(('class:clarify-question', question))
-            lines.append(('', '\n'))
-            lines.append(('class:clarify-border', '│\n'))
+            for wrapped in _wrap_panel_text(question, inner_text_width):
+                _append_panel_line(lines, 'class:clarify-border', 'class:clarify-question', wrapped, box_width)
+            _append_blank_panel_line(lines, 'class:clarify-border', box_width)
+
+            if cli_ref._clarify_freetext and not choices:
+                guidance = "Type your answer in the prompt below, then press Enter."
+                for wrapped in _wrap_panel_text(guidance, inner_text_width):
+                    _append_panel_line(lines, 'class:clarify-border', 'class:clarify-choice', wrapped, box_width)
+                _append_blank_panel_line(lines, 'class:clarify-border', box_width)
 
             if choices:
                 # Multiple-choice mode: show selectable options
                 for i, choice in enumerate(choices):
-                    lines.append(('class:clarify-border', '│  '))
-                    if i == selected and not cli_ref._clarify_freetext:
-                        lines.append(('class:clarify-selected', f'❯ {choice}'))
-                    else:
-                        lines.append(('class:clarify-choice', f'  {choice}'))
-                    lines.append(('', '\n'))
+                    style = 'class:clarify-selected' if i == selected and not cli_ref._clarify_freetext else 'class:clarify-choice'
+                    prefix = '❯ ' if i == selected and not cli_ref._clarify_freetext else '  '
+                    wrapped_lines = _wrap_panel_text(f"{prefix}{choice}", inner_text_width, subsequent_indent="  ")
+                    for wrapped in wrapped_lines:
+                        _append_panel_line(lines, 'class:clarify-border', style, wrapped, box_width)
 
                 # "Other" option (5th line, only shown when choices exist)
                 other_idx = len(choices)
-                lines.append(('class:clarify-border', '│  '))
                 if selected == other_idx and not cli_ref._clarify_freetext:
-                    lines.append(('class:clarify-selected', '❯ Other (type your answer)'))
+                    other_style = 'class:clarify-selected'
+                    other_label = '❯ Other (type your answer)'
                 elif cli_ref._clarify_freetext:
-                    lines.append(('class:clarify-active-other', '❯ Other (type below)'))
+                    other_style = 'class:clarify-active-other'
+                    other_label = '❯ Other (type below)'
                 else:
-                    lines.append(('class:clarify-choice', '  Other (type your answer)'))
-                lines.append(('', '\n'))
+                    other_style = 'class:clarify-choice'
+                    other_label = '  Other (type your answer)'
+                for wrapped in _wrap_panel_text(other_label, inner_text_width, subsequent_indent="  "):
+                    _append_panel_line(lines, 'class:clarify-border', other_style, wrapped, box_width)
 
-            lines.append(('class:clarify-border', '│\n'))
-            lines.append(('class:clarify-border', '╰──────────────────────────────────────────────────╯\n'))
+            _append_blank_panel_line(lines, 'class:clarify-border', box_width)
+            lines.append(('class:clarify-border', '╰' + ('─' * box_width) + '╯\n'))
             return lines
 
         clarify_widget = ConditionalContainer(
@@ -2465,16 +4373,18 @@ class HermesCLI:
             state = cli_ref._sudo_state
             if not state:
                 return []
+            title = '🔐 Sudo Password Required'
+            body = 'Enter password below (hidden), or press Enter to skip'
+            box_width = _panel_box_width(title, [body])
+            inner = max(0, box_width - 2)
             lines = []
             lines.append(('class:sudo-border', '╭─ '))
-            lines.append(('class:sudo-title', '🔐 Sudo Password Required'))
-            lines.append(('class:sudo-border', ' ──────────────────────────╮\n'))
-            lines.append(('class:sudo-border', '│\n'))
-            lines.append(('class:sudo-border', '│  '))
-            lines.append(('class:sudo-text', 'Enter password below (hidden), or press Enter to skip'))
-            lines.append(('', '\n'))
-            lines.append(('class:sudo-border', '│\n'))
-            lines.append(('class:sudo-border', '╰──────────────────────────────────────────────────╯\n'))
+            lines.append(('class:sudo-title', title))
+            lines.append(('class:sudo-border', ' ' + ('─' * max(0, box_width - len(title) - 3)) + '╮\n'))
+            _append_blank_panel_line(lines, 'class:sudo-border', box_width)
+            _append_panel_line(lines, 'class:sudo-border', 'class:sudo-text', body, box_width)
+            _append_blank_panel_line(lines, 'class:sudo-border', box_width)
+            lines.append(('class:sudo-border', '╰' + ('─' * box_width) + '╯\n'))
             return lines
 
         sudo_widget = ConditionalContainer(
@@ -2495,37 +4405,45 @@ class HermesCLI:
             description = state["description"]
             choices = state["choices"]
             selected = state.get("selected", 0)
+            show_full = state.get("show_full", False)
 
-            cmd_display = command[:70] + '...' if len(command) > 70 else command
+            if show_full or len(command) <= 70:
+                cmd_display = command
+            else:
+                cmd_display = command[:70] + '...'
             choice_labels = {
                 "once": "Allow once",
                 "session": "Allow for this session",
                 "always": "Add to permanent allowlist",
                 "deny": "Deny",
+                "view": "Show full command",
             }
+            preview_lines = _wrap_panel_text(description, 60)
+            preview_lines.extend(_wrap_panel_text(cmd_display, 60))
+            for i, choice in enumerate(choices):
+                prefix = '❯ ' if i == selected else '  '
+                preview_lines.extend(_wrap_panel_text(f"{prefix}{choice_labels.get(choice, choice)}", 60, subsequent_indent="  "))
+            box_width = _panel_box_width("⚠️  Dangerous Command", preview_lines)
+            inner_text_width = max(8, box_width - 2)
 
             lines = []
             lines.append(('class:approval-border', '╭─ '))
             lines.append(('class:approval-title', '⚠️  Dangerous Command'))
-            lines.append(('class:approval-border', ' ───────────────────────────────╮\n'))
-            lines.append(('class:approval-border', '│\n'))
-            lines.append(('class:approval-border', '│  '))
-            lines.append(('class:approval-desc', description))
-            lines.append(('', '\n'))
-            lines.append(('class:approval-border', '│  '))
-            lines.append(('class:approval-cmd', cmd_display))
-            lines.append(('', '\n'))
-            lines.append(('class:approval-border', '│\n'))
+            lines.append(('class:approval-border', ' ' + ('─' * max(0, box_width - len("⚠️  Dangerous Command") - 3)) + '╮\n'))
+            _append_blank_panel_line(lines, 'class:approval-border', box_width)
+            for wrapped in _wrap_panel_text(description, inner_text_width):
+                _append_panel_line(lines, 'class:approval-border', 'class:approval-desc', wrapped, box_width)
+            for wrapped in _wrap_panel_text(cmd_display, inner_text_width):
+                _append_panel_line(lines, 'class:approval-border', 'class:approval-cmd', wrapped, box_width)
+            _append_blank_panel_line(lines, 'class:approval-border', box_width)
             for i, choice in enumerate(choices):
-                lines.append(('class:approval-border', '│  '))
                 label = choice_labels.get(choice, choice)
-                if i == selected:
-                    lines.append(('class:approval-selected', f'❯ {label}'))
-                else:
-                    lines.append(('class:approval-choice', f'  {label}'))
-                lines.append(('', '\n'))
-            lines.append(('class:approval-border', '│\n'))
-            lines.append(('class:approval-border', '╰──────────────────────────────────────────────────────╯\n'))
+                style = 'class:approval-selected' if i == selected else 'class:approval-choice'
+                prefix = '❯ ' if i == selected else '  '
+                for wrapped in _wrap_panel_text(f"{prefix}{label}", inner_text_width, subsequent_indent="  "):
+                    _append_panel_line(lines, 'class:approval-border', style, wrapped, box_width)
+            _append_blank_panel_line(lines, 'class:approval-border', box_width)
+            lines.append(('class:approval-border', '╰' + ('─' * box_width) + '╯\n'))
             return lines
 
         approval_widget = ConditionalContainer(
@@ -2538,13 +4456,35 @@ class HermesCLI:
 
         # Horizontal rules above and below the input (bronze, 1 line each).
         # The bottom rule moves down as the TextArea grows with newlines.
+        # Using char='─' instead of hardcoded repetition so the rule
+        # always spans the full terminal width on any screen size.
         input_rule_top = Window(
-            content=FormattedTextControl([('class:input-rule', '─' * 200)]),
+            char='─',
             height=1,
+            style='class:input-rule',
         )
         input_rule_bot = Window(
-            content=FormattedTextControl([('class:input-rule', '─' * 200)]),
+            char='─',
             height=1,
+            style='class:input-rule',
+        )
+
+        # Image attachment indicator — shows badges like [📎 Image #1] above input
+        cli_ref = self
+
+        def _get_image_bar():
+            if not cli_ref._attached_images:
+                return []
+            base = cli_ref._image_counter - len(cli_ref._attached_images) + 1
+            badges = " ".join(
+                f"[📎 Image #{base + i}]"
+                for i in range(len(cli_ref._attached_images))
+            )
+            return [("class:image-badge", f" {badges} ")]
+
+        image_bar = Window(
+            content=FormattedTextControl(_get_image_bar),
+            height=Condition(lambda: bool(cli_ref._attached_images)),
         )
 
         # Layout: interactive prompt widgets + ruled input at bottom.
@@ -2556,8 +4496,10 @@ class HermesCLI:
                 sudo_widget,
                 approval_widget,
                 clarify_widget,
+                spinner_widget,
                 spacer,
                 input_rule_top,
+                image_bar,
                 input_area,
                 input_rule_bot,
                 CompletionsMenu(max_height=12, scroll_offset=1),
@@ -2573,6 +4515,8 @@ class HermesCLI:
             'hint': '#555555 italic',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
+            # Clipboard image attachment badges
+            'image-badge': '#87CEEB bold',
             'completion-menu': 'bg:#1a1a2e #FFF8DC',
             'completion-menu.completion': 'bg:#1a1a2e #FFF8DC',
             'completion-menu.completion.current': 'bg:#333355 #FFD700',
@@ -2607,8 +4551,22 @@ class HermesCLI:
             style=style,
             full_screen=False,
             mouse_support=False,
+            **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
         self._app = app  # Store reference for clarify_callback
+
+        def spinner_loop():
+            import time as _time
+
+            while not self._should_exit:
+                if self._command_running and self._app:
+                    self._invalidate(min_interval=0.1)
+                    _time.sleep(0.1)
+                else:
+                    _time.sleep(0.05)
+
+        spinner_thread = threading.Thread(target=spinner_loop, daemon=True)
+        spinner_thread.start()
         
         # Background thread to process inputs and run agent
         def process_loop():
@@ -2622,10 +4580,15 @@ class HermesCLI:
                     
                     if not user_input:
                         continue
+
+                    # Unpack image payload: (text, [Path, ...]) or plain str
+                    submit_images = []
+                    if isinstance(user_input, tuple):
+                        user_input, submit_images = user_input
                     
                     # Check for commands
-                    if user_input.startswith("/"):
-                        print(f"\n⚙️  {user_input}")
+                    if isinstance(user_input, str) and user_input.startswith("/"):
+                        _cprint(f"\n⚙️  {user_input}")
                         if not self.process_command(user_input):
                             self._should_exit = True
                             # Schedule app exit
@@ -2635,7 +4598,7 @@ class HermesCLI:
                     
                     # Expand paste references back to full content
                     import re as _re
-                    paste_match = _re.match(r'\[Pasted text #\d+: \d+ lines → (.+)\]', user_input)
+                    paste_match = _re.match(r'\[Pasted text #\d+: \d+ lines → (.+)\]', user_input) if isinstance(user_input, str) else None
                     if paste_match:
                         paste_path = Path(paste_match.group(1))
                         if paste_path.exists():
@@ -2657,14 +4620,20 @@ class HermesCLI:
                             print()
                             _cprint(f"{_GOLD}●{_RST} {_BOLD}{user_input}{_RST}")
                     
+                    # Show image attachment count
+                    if submit_images:
+                        n = len(submit_images)
+                        _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
+
                     # Regular chat - run agent
                     self._agent_running = True
                     app.invalidate()  # Refresh status line
                     
                     try:
-                        self.chat(user_input)
+                        self.chat(user_input, images=submit_images or None)
                     finally:
                         self._agent_running = False
+                        self._spinner_text = ""
                         app.invalidate()  # Refresh status line
                     
                 except Exception as e:
@@ -2718,11 +4687,16 @@ def main(
     base_url: str = None,
     max_turns: int = None,
     verbose: bool = False,
+    quiet: bool = False,
     compact: bool = False,
     list_tools: bool = False,
     list_toolsets: bool = False,
     gateway: bool = False,
     resume: str = None,
+    worktree: bool = False,
+    w: bool = False,
+    checkpoints: bool = False,
+    pass_session_id: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -2732,7 +4706,7 @@ def main(
         q: Shorthand for --query
         toolsets: Comma-separated list of toolsets to enable (e.g., "web,terminal")
         model: Model to use (default: anthropic/claude-opus-4-20250514)
-        provider: Inference provider ("auto", "openrouter", "nous")
+        provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
         api_key: API key for authentication
         base_url: Base URL for the API
         max_turns: Maximum tool-calling iterations (default: 60)
@@ -2741,6 +4715,8 @@ def main(
         list_tools: List available tools and exit
         list_toolsets: List available toolsets and exit
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
+        worktree: Run in an isolated git worktree (for parallel agents). Alias: -w
+        w: Shorthand for --worktree
     
     Examples:
         python cli.py                            # Start interactive mode
@@ -2748,7 +4724,11 @@ def main(
         python cli.py -q "What is Python?"       # Single query mode
         python cli.py --list-tools               # List tools and exit
         python cli.py --resume 20260225_143052_a1b2c3  # Resume session
+        python cli.py -w                         # Start in isolated git worktree
+        python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
+    global _active_worktree
+
     # Signal to terminal_tool that we're in interactive mode
     # This enables interactive sudo password prompts with timeout
     os.environ["HERMES_INTERACTIVE"] = "1"
@@ -2760,6 +4740,30 @@ def main(
         print("Starting Hermes Gateway (messaging platforms)...")
         asyncio.run(start_gateway())
         return
+
+    # Skip worktree for list commands (they exit immediately)
+    if not list_tools and not list_toolsets:
+        # ── Git worktree isolation (#652) ──
+        # Create an isolated worktree so this agent instance doesn't collide
+        # with other agents working on the same repo.
+        use_worktree = worktree or w or CLI_CONFIG.get("worktree", False)
+        wt_info = None
+        if use_worktree:
+            # Prune stale worktrees from crashed/killed sessions
+            _repo = _git_repo_root()
+            if _repo:
+                _prune_stale_worktrees(_repo)
+            wt_info = _setup_worktree()
+            if wt_info:
+                _active_worktree = wt_info
+                os.environ["TERMINAL_CWD"] = wt_info["path"]
+                atexit.register(_cleanup_worktree, wt_info)
+            else:
+                # Worktree was explicitly requested but setup failed —
+                # don't silently run without isolation.
+                return
+    else:
+        wt_info = None
     
     # Handle query shorthand
     query = query or q
@@ -2797,7 +4801,20 @@ def main(
         verbose=verbose,
         compact=compact,
         resume=resume,
+        checkpoints=checkpoints,
+        pass_session_id=pass_session_id,
     )
+
+    # Inject worktree context into agent's system prompt
+    if wt_info:
+        wt_note = (
+            f"\n\n[System note: You are working in an isolated git worktree at "
+            f"{wt_info['path']}. Your branch is `{wt_info['branch']}`. "
+            f"Changes here do not affect the main working tree or other agents. "
+            f"Remember to commit and push your changes, and create a PR if appropriate. "
+            f"The original repo is at {wt_info['repo_root']}.]"
+        )
+        cli.system_prompt = (cli.system_prompt or "") + wt_note
     
     # Handle list commands (don't init agent for these)
     if list_tools:
@@ -2815,10 +4832,22 @@ def main(
     
     # Handle single query mode
     if query:
-        cli.show_banner()
-        cli.console.print(f"[bold blue]Query:[/] {query}")
-        cli.chat(query)
-        cli._print_exit_summary()
+        if quiet:
+            # Quiet mode: suppress banner, spinner, tool previews.
+            # Only print the final response and parseable session info.
+            cli.tool_progress_mode = "off"
+            if cli._init_agent():
+                cli.agent.quiet_mode = True
+                result = cli.agent.run_conversation(query)
+                response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+                if response:
+                    print(response)
+                print(f"\nsession_id: {cli.session_id}")
+        else:
+            cli.show_banner()
+            cli.console.print(f"[bold blue]Query:[/] {query}")
+            cli.chat(query)
+            cli._print_exit_summary()
         return
     
     # Run interactive mode

@@ -458,6 +458,11 @@ install_system_packages() {
     if [ -n "$pkg_install" ]; then
         local install_cmd="$pkg_install ${pkgs[*]}"
 
+        # Prevent needrestart/whiptail dialogs from blocking non-interactive installs
+        case "$DISTRO" in
+            ubuntu|debian) export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a ;;
+        esac
+
         # Already root — just install
         if [ "$(id -u)" -eq 0 ]; then
             log_info "Installing ${pkgs[*]}..."
@@ -469,7 +474,7 @@ install_system_packages() {
         # Passwordless sudo — just install
         elif command -v sudo &> /dev/null && sudo -n true 2>/dev/null; then
             log_info "Installing ${pkgs[*]}..."
-            if sudo $install_cmd; then
+            if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a $install_cmd; then
                 [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
                 [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
                 return 0
@@ -481,15 +486,29 @@ install_system_packages() {
                 read -p "Install ${description}? (requires sudo) [y/N] " -n 1 -r
                 echo
                 if [[ $REPLY =~ ^[Yy]$ ]]; then
-                    if sudo $install_cmd; then
+                    if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a $install_cmd; then
+                        [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
+                        [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
+                        return 0
+                    fi
+                fi
+            elif [ -e /dev/tty ]; then
+                # Non-interactive (e.g. curl | bash) but a terminal is available.
+                # Read the prompt from /dev/tty (same approach the setup wizard uses).
+                echo ""
+                log_info "Installing ${description} requires sudo."
+                read -p "Install? [Y/n] " -n 1 -r < /dev/tty
+                echo
+                if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+                    if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a $install_cmd < /dev/tty; then
                         [ "$need_ripgrep" = true ] && HAS_RIPGREP=true && log_success "ripgrep installed"
                         [ "$need_ffmpeg" = true ]  && HAS_FFMPEG=true  && log_success "ffmpeg installed"
                         return 0
                     fi
                 fi
             else
-                log_warn "Non-interactive mode: cannot prompt for sudo password"
-                log_info "Install missing packages manually: sudo $install_cmd"
+                log_warn "Non-interactive mode and no terminal available — cannot install system packages"
+                log_info "Install manually after setup completes: sudo $install_cmd"
             fi
         fi
     fi
@@ -623,13 +642,13 @@ install_deps() {
             log_info "Some build tools may be needed for Python packages..."
             if command -v sudo &> /dev/null; then
                 if sudo -n true 2>/dev/null; then
-                    sudo apt-get update -qq && sudo apt-get install -y -qq build-essential python3-dev libffi-dev >/dev/null 2>&1 || true
+                    sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq build-essential python3-dev libffi-dev >/dev/null 2>&1 || true
                     log_success "Build tools installed"
                 else
                     read -p "Install build tools (build-essential, python3-dev)? (requires sudo) [Y/n] " -n 1 -r < /dev/tty
                     echo
                     if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
-                        sudo apt-get update -qq && sudo apt-get install -y -qq build-essential python3-dev libffi-dev >/dev/null 2>&1 || true
+                        sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq build-essential python3-dev libffi-dev >/dev/null 2>&1 || true
                         log_success "Build tools installed"
                     fi
                 fi
@@ -824,6 +843,33 @@ install_node_deps() {
             log_warn "npm install failed (browser tools may not work)"
         }
         log_success "Node.js dependencies installed"
+
+        # Install Playwright browser + system dependencies.
+        # Playwright's install-deps only supports apt/dnf/zypper natively.
+        # For Arch/Manjaro we install the system libs via pacman first.
+        log_info "Installing browser engine (Playwright Chromium)..."
+        case "$DISTRO" in
+            arch|manjaro)
+                if command -v pacman &> /dev/null; then
+                    log_info "Arch/Manjaro detected — installing Chromium system dependencies via pacman..."
+                    if command -v sudo &> /dev/null && sudo -n true 2>/dev/null; then
+                        sudo NEEDRESTART_MODE=a pacman -S --noconfirm --needed \
+                            nss atk at-spi2-core cups libdrm libxkbcommon mesa pango cairo alsa-lib >/dev/null 2>&1 || true
+                    elif [ "$(id -u)" -eq 0 ]; then
+                        pacman -S --noconfirm --needed \
+                            nss atk at-spi2-core cups libdrm libxkbcommon mesa pango cairo alsa-lib >/dev/null 2>&1 || true
+                    else
+                        log_warn "Cannot install browser deps without sudo. Run manually:"
+                        log_warn "  sudo pacman -S nss atk at-spi2-core cups libdrm libxkbcommon mesa pango cairo alsa-lib"
+                    fi
+                fi
+                cd "$INSTALL_DIR" && npx playwright install chromium 2>/dev/null || true
+                ;;
+            *)
+                cd "$INSTALL_DIR" && npx playwright install --with-deps chromium 2>/dev/null || true
+                ;;
+        esac
+        log_success "Browser engine installed"
     fi
 
     # Install WhatsApp bridge dependencies
@@ -843,8 +889,11 @@ run_setup_wizard() {
         return 0
     fi
 
-    if [ "$IS_INTERACTIVE" = false ]; then
-        log_info "Setup wizard skipped (non-interactive). Run 'hermes setup' after install."
+    # The setup wizard reads from /dev/tty, so it works even when the
+    # install script itself is piped (curl | bash). Only skip if no
+    # terminal is available at all (e.g. Docker build, CI).
+    if ! [ -e /dev/tty ]; then
+        log_info "Setup wizard skipped (no terminal available). Run 'hermes setup' after install."
         return 0
     fi
 
@@ -908,8 +957,8 @@ maybe_start_gateway() {
         fi
     fi
 
-    if [ "$IS_INTERACTIVE" = false ]; then
-        log_info "Gateway setup skipped (non-interactive). Run 'hermes gateway install' later."
+    if ! [ -e /dev/tty ]; then
+        log_info "Gateway setup skipped (no terminal available). Run 'hermes gateway install' later."
         return 0
     fi
 

@@ -67,9 +67,17 @@ class TestReadResult:
     def test_to_dict_omits_defaults(self):
         r = ReadResult()
         d = r.to_dict()
-        assert "content" not in d  # empty string omitted
         assert "error" not in d    # None omitted
         assert "similar_files" not in d  # empty list omitted
+
+    def test_to_dict_preserves_empty_content(self):
+        """Empty file should still have content key in the dict."""
+        r = ReadResult(content="", total_lines=0, file_size=0)
+        d = r.to_dict()
+        assert "content" in d
+        assert d["content"] == ""
+        assert d["total_lines"] == 0
+        assert d["file_size"] == 0
 
     def test_to_dict_includes_values(self):
         r = ReadResult(content="hello", total_lines=10, file_size=50, truncated=True)
@@ -249,6 +257,70 @@ class TestShellFileOpsHelpers:
         env = MagicMock(spec=[])  # no cwd attribute
         ops = ShellFileOperations(env)
         assert ops.cwd == "/"
+
+
+class TestSearchPathValidation:
+    """Test that search() returns an error for non-existent paths."""
+
+    def test_search_nonexistent_path_returns_error(self, mock_env):
+        """search() should return an error when the path doesn't exist."""
+        def side_effect(command, **kwargs):
+            if "test -e" in command:
+                return {"output": "not_found", "returncode": 1}
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            return {"output": "", "returncode": 0}
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.search("pattern", path="/nonexistent/path")
+        assert result.error is not None
+        assert "not found" in result.error.lower() or "Path not found" in result.error
+
+    def test_search_nonexistent_path_files_mode(self, mock_env):
+        """search(target='files') should also return error for bad paths."""
+        def side_effect(command, **kwargs):
+            if "test -e" in command:
+                return {"output": "not_found", "returncode": 1}
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            return {"output": "", "returncode": 0}
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.search("*.py", path="/nonexistent/path", target="files")
+        assert result.error is not None
+        assert "not found" in result.error.lower() or "Path not found" in result.error
+
+    def test_search_existing_path_proceeds(self, mock_env):
+        """search() should proceed normally when the path exists."""
+        def side_effect(command, **kwargs):
+            if "test -e" in command:
+                return {"output": "exists", "returncode": 0}
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            # rg returns exit 1 (no matches) with empty output
+            return {"output": "", "returncode": 1}
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.search("pattern", path="/existing/path")
+        assert result.error is None
+        assert result.total_count == 0  # No matches but no error
+
+    def test_search_rg_error_exit_code(self, mock_env):
+        """search() should report error when rg returns exit code 2."""
+        call_count = {"n": 0}
+        def side_effect(command, **kwargs):
+            call_count["n"] += 1
+            if "test -e" in command:
+                return {"output": "exists", "returncode": 0}
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            # rg returns exit 2 (error) with empty output
+            return {"output": "", "returncode": 2}
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.search("pattern", path="/some/path")
+        assert result.error is not None
+        assert "search failed" in result.error.lower() or "Search error" in result.error
 
 
 class TestShellFileOpsWriteDenied:

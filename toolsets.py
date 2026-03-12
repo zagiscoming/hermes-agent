@@ -62,6 +62,8 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Honcho user context (gated on honcho being active via check_fn)
     "query_user_context",
+    # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
+    "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
 
 
@@ -193,8 +195,14 @@ TOOLSETS = {
         "tools": ["query_user_context"],
         "includes": []
     },
-    
-    
+
+    "homeassistant": {
+        "description": "Home Assistant smart home control and monitoring",
+        "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "includes": []
+    },
+
+
     # Scenario-specific toolsets
     
     "debugging": {
@@ -247,10 +255,28 @@ TOOLSETS = {
         "includes": []
     },
     
+    "hermes-signal": {
+        "description": "Signal bot toolset - encrypted messaging platform (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-homeassistant": {
+        "description": "Home Assistant bot toolset - smart home event monitoring and control",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-email": {
+        "description": "Email bot toolset - interact with Hermes via email (IMAP/SMTP)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email"]
     }
 }
 

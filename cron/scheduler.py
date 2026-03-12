@@ -27,6 +27,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from hermes_time import now as _hermes_now
+
 logger = logging.getLogger(__name__)
 
 # Add parent directory to path for imports
@@ -43,7 +45,7 @@ _LOCK_FILE = _LOCK_DIR / ".tick.lock"
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
-    """Extract origin info from a job, returning {platform, chat_id, chat_name} or None."""
+    """Extract origin info from a job, preserving any extra routing metadata."""
     origin = job.get("origin")
     if not origin:
         return None
@@ -67,6 +69,8 @@ def _deliver_result(job: dict, content: str) -> None:
     if deliver == "local":
         return
 
+    thread_id = None
+
     # Resolve target platform + chat_id
     if deliver == "origin":
         if not origin:
@@ -74,6 +78,7 @@ def _deliver_result(job: dict, content: str) -> None:
             return
         platform_name = origin["platform"]
         chat_id = origin["chat_id"]
+        thread_id = origin.get("thread_id")
     elif ":" in deliver:
         platform_name, chat_id = deliver.split(":", 1)
     else:
@@ -81,6 +86,7 @@ def _deliver_result(job: dict, content: str) -> None:
         platform_name = deliver
         if origin and origin.get("platform") == platform_name:
             chat_id = origin["chat_id"]
+            thread_id = origin.get("thread_id")
         else:
             # Fall back to home channel
             chat_id = os.getenv(f"{platform_name.upper()}_HOME_CHANNEL", "")
@@ -96,6 +102,8 @@ def _deliver_result(job: dict, content: str) -> None:
         "discord": Platform.DISCORD,
         "slack": Platform.SLACK,
         "whatsapp": Platform.WHATSAPP,
+        "signal": Platform.SIGNAL,
+        "email": Platform.EMAIL,
     }
     platform = platform_map.get(platform_name.lower())
     if not platform:
@@ -115,13 +123,13 @@ def _deliver_result(job: dict, content: str) -> None:
 
     # Run the async send in a fresh event loop (safe from any thread)
     try:
-        result = asyncio.run(_send_to_platform(platform, pconfig, chat_id, content))
+        result = asyncio.run(_send_to_platform(platform, pconfig, chat_id, content, thread_id=thread_id))
     except RuntimeError:
         # asyncio.run() fails if there's already a running loop in this thread;
         # spin up a new thread to avoid that.
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, content))
+            future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, content, thread_id=thread_id))
             result = future.result(timeout=30)
     except Exception as e:
         logger.error("Job '%s': delivery to %s:%s failed: %s", job["id"], platform_name, chat_id, e)
@@ -134,9 +142,9 @@ def _deliver_result(job: dict, content: str) -> None:
         # Mirror the delivered content into the target's gateway session
         try:
             from gateway.mirror import mirror_to_session
-            mirror_to_session(platform_name, chat_id, content, source_label="cron")
-        except Exception:
-            pass
+            mirror_to_session(platform_name, chat_id, content, source_label="cron", thread_id=thread_id)
+        except Exception as e:
+            logger.warning("Job '%s': mirror_to_session failed: %s", job["id"], e)
 
 
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
@@ -172,11 +180,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except UnicodeDecodeError:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
 
-        model = os.getenv("HERMES_MODEL", "anthropic/claude-opus-4.6")
-        # Custom endpoint (OPENAI_*) takes precedence, matching CLI behavior
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
-        base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        model = os.getenv("HERMES_MODEL") or "anthropic/claude-opus-4.6"
 
+        # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
+        _cfg = {}
         try:
             import yaml
             _cfg_path = str(_hermes_home / "config.yaml")
@@ -188,26 +195,72 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     model = _model_cfg
                 elif isinstance(_model_cfg, dict):
                     model = _model_cfg.get("default", model)
-                    base_url = _model_cfg.get("base_url", base_url)
-                # Check if provider is nous — resolve OAuth credentials
-                provider = _model_cfg.get("provider", "") if isinstance(_model_cfg, dict) else ""
-                if provider == "nous":
-                    try:
-                        from hermes_cli.auth import resolve_nous_runtime_credentials
-                        creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=5 * 60)
-                        api_key = creds.get("api_key", api_key)
-                        base_url = creds.get("base_url", base_url)
-                    except Exception as nous_err:
-                        logging.warning("Nous Portal credential resolution failed for cron: %s", nous_err)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+
+        # Reasoning config from env or config.yaml
+        reasoning_config = None
+        effort = os.getenv("HERMES_REASONING_EFFORT", "")
+        if not effort:
+            effort = str(_cfg.get("agent", {}).get("reasoning_effort", "")).strip()
+        if effort and effort.lower() != "none":
+            valid = ("xhigh", "high", "medium", "low", "minimal")
+            if effort.lower() in valid:
+                reasoning_config = {"enabled": True, "effort": effort.lower()}
+        elif effort.lower() == "none":
+            reasoning_config = {"enabled": False}
+
+        # Prefill messages from env or config.yaml
+        prefill_messages = None
+        prefill_file = os.getenv("HERMES_PREFILL_MESSAGES_FILE", "") or _cfg.get("prefill_messages_file", "")
+        if prefill_file:
+            import json as _json
+            pfpath = Path(prefill_file).expanduser()
+            if not pfpath.is_absolute():
+                pfpath = _hermes_home / pfpath
+            if pfpath.exists():
+                try:
+                    with open(pfpath, "r", encoding="utf-8") as _pf:
+                        prefill_messages = _json.load(_pf)
+                    if not isinstance(prefill_messages, list):
+                        prefill_messages = None
+                except Exception as e:
+                    logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
+                    prefill_messages = None
+
+        # Max iterations
+        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+
+        # Provider routing
+        pr = _cfg.get("provider_routing", {})
+
+        from hermes_cli.runtime_provider import (
+            resolve_runtime_provider,
+            format_runtime_provider_error,
+        )
+        try:
+            runtime = resolve_runtime_provider(
+                requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+            )
+        except Exception as exc:
+            message = format_runtime_provider_error(exc)
+            raise RuntimeError(message) from exc
 
         agent = AIAgent(
             model=model,
-            api_key=api_key,
-            base_url=base_url,
+            api_key=runtime.get("api_key"),
+            base_url=runtime.get("base_url"),
+            provider=runtime.get("provider"),
+            api_mode=runtime.get("api_mode"),
+            max_iterations=max_iterations,
+            reasoning_config=reasoning_config,
+            prefill_messages=prefill_messages,
+            providers_allowed=pr.get("only"),
+            providers_ignored=pr.get("ignore"),
+            providers_order=pr.get("order"),
+            provider_sort=pr.get("sort"),
             quiet_mode=True,
-            session_id=f"cron_{job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            session_id=f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
         )
         
         result = agent.run_conversation(prompt)
@@ -219,7 +272,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
-**Run Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
 ## Prompt
@@ -241,7 +294,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
-**Run Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
 ## Prompt
@@ -280,6 +333,7 @@ def tick(verbose: bool = True) -> int:
     _LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
+    lock_fd = None
     try:
         lock_fd = open(_LOCK_FILE, "w")
         if fcntl:
@@ -288,17 +342,19 @@ def tick(verbose: bool = True) -> int:
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
     except (OSError, IOError):
         logger.debug("Tick skipped — another instance holds the lock")
+        if lock_fd is not None:
+            lock_fd.close()
         return 0
 
     try:
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
-            logger.info("%s - No jobs due", datetime.now().strftime('%H:%M:%S'))
+            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
             return 0
 
         if verbose:
-            logger.info("%s - %s job(s) due", datetime.now().strftime('%H:%M:%S'), len(due_jobs))
+            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
         executed = 0
         for job in due_jobs:
