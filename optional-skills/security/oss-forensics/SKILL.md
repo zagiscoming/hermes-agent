@@ -48,6 +48,16 @@ Read these before every investigation step. Violating them invalidates the repor
 
 ---
 
+## Example Scenarios
+
+- **Scenario A: Dependency Confusion**: A malicious package `internal-lib-v2` is uploaded to NPM with a higher version than the internal one. The investigator must track when this package was first seen and if any PushEvents in the target repo updated `package.json` to this version.
+- **Scenario B: Maintainer Takeover**: A long-term contributor's account is used to push a backdoored `.github/workflows/build.yml`. The investigator looks for PushEvents from this user after a long period of inactivity or from a new IP/location (if detectable via BigQuery).
+- **Scenario C: Force-Push Hide**: A developer accidentally commits a production secret, then force-pushes to "fix" it. The investigator uses `git fsck` and GH Archive to recover the original commit SHA and verify what was leaked.
+
+---
+
+---
+
 ## Phase 0: Initialization
 
 1. Create investigation working directory:
@@ -197,6 +207,12 @@ curl -s "https://web.archive.org/cdx/search/cdx?url=github.com/OWNER/REPO/pull/N
 # Fetch the best snapshot of a page
 # Use the Wayback Machine URL: https://web.archive.org/web/TIMESTAMP/ORIGINAL_URL
 # Example: https://web.archive.org/web/20240101000000*/github.com/OWNER/REPO
+
+# Advanced: Search for deleted releases/tags
+curl -s "https://web.archive.org/cdx/search/cdx?url=github.com/OWNER/REPO/releases/tag/*&output=json" > wayback_tags.json
+
+# Advanced: Search for historical wiki changes
+curl -s "https://web.archive.org/cdx/search/cdx?url=github.com/OWNER/REPO/wiki/*&output=json" > wayback_wiki.json
 ```
 
 **Evidence to collect**:
